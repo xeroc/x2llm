@@ -135,6 +135,14 @@ def main(argv: list[str] | None = None) -> int:
 
 
 @cli.command()
+@click.argument("text")
+@click.option("--reply-to", default=None, help="Tweet id to reply to.")
+def post(text: str, reply_to: str | None) -> None:
+    """Post a tweet. REAL action: public and permanent. Use with care."""
+    invoke(lambda c: cores.post_tweet(c, text, reply_to=reply_to))
+
+
+@cli.command()
 @click.argument("tweet_id")
 def like(tweet_id: str) -> None:
     """Like a tweet. REAL action: publicly visible, notifies the author."""

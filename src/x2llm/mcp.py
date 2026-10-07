@@ -105,6 +105,16 @@ MCP_TOOLS = [
         True,
     ),
     (
+        "post_tweet",
+        (
+            "Post a tweet as the logged-in user. REAL action: public, "
+            "permanent, visible to everyone. Never call unless the user "
+            "explicitly provided the exact text and asked for it to be posted."
+        ),
+        cores.post_tweet,
+        False,
+    ),
+    (
         "like_tweet",
         (
             "Like a post as the logged-in user. REAL action: publicly visible, "

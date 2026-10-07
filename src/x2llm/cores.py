@@ -216,3 +216,22 @@ async def home(c, limit: int = 20, cursor: str | None = None, tab: str = "for_yo
         "tweets": collect_tweets(data)[:limit],
         "cursor": collect_cursors(data).get("bottom"),
     }
+
+
+async def post_tweet(c, text: str, reply_to: str | None = None) -> dict:
+    variables = {
+        "tweet_text": text,
+        "media": {"media_entities": [], "possibly_sensitive": False},
+        "semantic_annotation_ids": [],
+        "disallowed_reply_options": None,
+        "semantic_annotation_options": {"source": "Unknown"},
+    }
+    if reply_to:
+        variables["reply"] = {"in_reply_to_tweet_id": str(reply_to), "exclude_reply_user_ids": []}
+    data = await c.graphql_post("create_tweet", variables)
+    result = (data.get("data") or {}).get("create_tweet", {})
+    tweet = (result.get("tweet_results") or {}).get("result") or {}
+    errors = data.get("errors") or []
+    if errors:
+        return {"posted": False, "detail": errors[0].get("message")}
+    return {"posted": True, "id": tweet.get("rest_id"), "text": (tweet.get("legacy") or {}).get("full_text")}

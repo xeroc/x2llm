@@ -186,7 +186,7 @@ class FakeClient:
         return self.response
 
     async def graphql_post(self, key, variables):
-        self.calls.append(("mutation" if key == "like" else "post", key, variables))
+        self.calls.append(("mutation" if key in ("like", "create_tweet") else "post", key, variables))
         return self.response
 
     async def rest(self, path, params):
@@ -325,6 +325,19 @@ def test_home_core_builds_variables_and_pages():
     assert fake.calls[2][2] == {"count": 2, "enableRanking": True,
                                 "includePromotedContent": True}
 
+def test_post_tweet_core_shapes():
+    response = {"data": {"create_tweet": {"tweet_results": {"result": {
+        "rest_id": "99", "legacy": {"full_text": "hi"}}}}}}
+    fake = FakeClient(response)
+    result = _run(cores.post_tweet(fake, "hi"))
+    kind, key, variables = fake.calls[0]
+    assert (kind, key) == ("mutation", "create_tweet")
+    assert variables["tweet_text"] == "hi" and "reply" not in variables
+    assert result == {"posted": True, "id": "99", "text": "hi"}
+    _run(cores.post_tweet(fake, "yo", reply_to="42"))
+    assert fake.calls[1][2]["reply"] == {"in_reply_to_tweet_id": "42", "exclude_reply_user_ids": []}
+
+
 def test_like_core_surfaces_graphql_error():
     fake = FakeClient({"data": {}, "errors": [{"message": "already favorited"}]})
     assert _run(cores.like(fake, "42")) == {
@@ -397,7 +410,7 @@ def test_mcp_server_stdio_roundtrip():
         replies = [json.loads(proc.stdout.readline()) for _ in range(2)]
         tools = [t["name"] for t in replies[1]["result"]["tools"]]
         assert replies[0]["result"]["serverInfo"]["name"] == "x2llm"
-        assert "search" in tools and "get_tweet" in tools and len(tools) == 11
+        assert "search" in tools and "get_tweet" in tools and len(tools) == 12
     finally:
         proc.stdin.close()
         proc.terminate()
@@ -446,7 +459,7 @@ def test_generator_merges_incrementally_without_writing_source(tmp_path):
                               ("notifications", "NotificationsTimeline"), ("badges", "ViewerBadgeCounts"),
                               ("analytics", "accountOverviewDailyQuery"), ("user", "UserByScreenName"),
                               ("home", "HomeTimeline"), ("home_following", "HomeLatestTimeline"),
-                              ("like", "FavoriteTweet")]}
+                              ("like", "FavoriteTweet"), ("create_tweet", "CreateTweet")]}
     seed["tweet"] = {"query_id": "K", "name": "TweetDetail", "method": "get"}
     registry.write_text(gen.render(seed, "Bearer x"))
     har = tmp_path / "mini.har"

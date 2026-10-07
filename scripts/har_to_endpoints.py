@@ -37,7 +37,7 @@ READS = {
 }
 POST_READS = {"HomeTimeline": "home",  # FOR YOU tab
               "HomeLatestTimeline": "home_following"}  # FOLLOWING tab
-MUTATIONS = {"FavoriteTweet": "like"}
+MUTATIONS = {"FavoriteTweet": "like", "CreateTweet": "create_tweet"}
 
 
 def load_registry(path: Path) -> tuple[dict, str]:
