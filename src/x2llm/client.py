@@ -12,6 +12,10 @@ mirroring ct0. Some endpoints additionally validate x-client-transaction-id
 
 A client-side rate limiter spaces requests at most X_RATE_LIMIT per minute
 (default 30, 0 disables) so the tool stays inside power-user territory.
+
+Transaction ids (x-client-transaction-id) are minted on demand by TxidFactory
+(txgen.py) - two anonymous fetches of x.com's public page, then pure CPU.
+Manual entries in the X_TXIDS env var override the generator per operation.
 """
 from __future__ import annotations
 
@@ -23,6 +27,7 @@ import httpx
 
 from .config import Config
 from .registry import GRAPHQL
+from .txgen import TxidFactory
 
 
 class XApiError(Exception):
@@ -38,9 +43,12 @@ class XClient:
         self._min_interval = 60.0 / config.rate_per_min if config.rate_per_min > 0 else 0.0
         self._rl_lock = asyncio.Lock()
         self._next_slot = 0.0
+        self._txgen = None
 
     async def aclose(self) -> None:
         await self._http.aclose()
+        if self._txgen is not None:
+            await self._txgen.aclose()
 
     async def graphql(self, key: str, variables: dict) -> dict:
         """Read: GET with variables (+ per-endpoint features/fieldToggles) in the query string."""
@@ -50,11 +58,12 @@ class XClient:
             params["features"] = json.dumps(ep["features"], separators=(",", ":"))
         if ep.get("toggles"):
             params["fieldToggles"] = json.dumps(ep["toggles"], separators=(",", ":"))
+        path = f"/graphql/{ep['query_id']}/{ep['name']}"
         await self._throttle()
         response = await self._http.get(
-            f"{self.config.api_base}/graphql/{ep['query_id']}/{ep['name']}",
+            f"{self.config.api_base}{path}",
             params=params,
-            headers=self._headers(self.config.txids.get(key)),
+            headers=self._headers(await self._txid(key, "GET", f"/i/api{path}")),
         )
         return self._json(response, ep["name"])
 
@@ -67,11 +76,12 @@ class XClient:
             body["features"] = ep["features"]
         if ep.get("toggles"):
             body["fieldToggles"] = ep["toggles"]
+        path = f"/graphql/{ep['query_id']}/{ep['name']}"
         await self._throttle()
         response = await self._http.post(
-            f"{self.config.api_base}/graphql/{ep['query_id']}/{ep['name']}",
+            f"{self.config.api_base}{path}",
             json=body,
-            headers=self._headers(self.config.txids.get(key)),
+            headers=self._headers(await self._txid(key, "POST", f"/i/api{path}")),
         )
         return self._json(response, ep["name"])
 
@@ -81,6 +91,21 @@ class XClient:
             f"{self.config.api_base}{path}", params=params, headers=self._headers(None)
         )
         return self._json(response, path)
+
+    async def _txid(self, key, method, path):
+        """Manual X_TXIDS entry wins; otherwise mint fresh (only some
+        endpoints validate txids - search, like)."""
+        manual = self.config.txids.get(key)
+        if manual:
+            return manual
+        if self._txgen is None:
+            self._txgen = TxidFactory()
+        try:
+            await self._txgen.init()
+        except Exception:  # noqa: BLE001 - a txid-less request is still worth trying
+            self._txgen = None
+            return None
+        return self._txgen.generate(method, path)
 
     async def _throttle(self) -> None:
         if not self._min_interval:
