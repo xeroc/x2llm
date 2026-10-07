@@ -1,0 +1,9 @@
+.env*
+!.env.example
+registry.new.py
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+dist/
+*.har
