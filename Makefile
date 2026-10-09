@@ -1,7 +1,5 @@
 .PHONY: help setup install uninstall test lint fmt check refresh clean
 
--include .env
-export
 
 UV ?= uv
 
@@ -28,7 +26,7 @@ fmt: ## Ruff autofix
 
 check: lint test ## Everything a change must pass
 
-refresh: ## Harvest HAR: propose registry.new.py + write .env.fresh (txids/cookies)
+refresh: ## Harvest HAR: propose registry.new.py + upsert account into local db
 	$(UV) run python scripts/har_to_endpoints.py '$(HAR)'
 
 clean: ## Remove caches

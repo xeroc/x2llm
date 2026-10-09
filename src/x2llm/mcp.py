@@ -1,17 +1,24 @@
-"""Stdio MCP server exposing the same cores as the CLI (reads + like_tweet)."""
+"""Stdio MCP server exposing the same cores as the CLI (reads + like_tweet).
+
+Account selection is per tool call via the `username` parameter (omitted =
+the only stored account); the `accounts` tool lists what is stored.
+"""
 from __future__ import annotations
 
 import asyncio
 import inspect
 
-from . import cores
+from . import cores, store
 from .client import XApiError, XClient
 from .config import Config, ConfigError
 
 MCP_INSTRUCTIONS = (
-    "Access to a logged-in x.com (Twitter) account via the private web API. "
-    "Credentials come from X_AUTH_TOKEN/X_CT0 environment variables - if they "
-    "expire every tool returns an auth error. All tools are read-only except "
+    "Access to logged-in x.com (Twitter) accounts via the private web API. "
+    "Accounts live in a local store: call the `accounts` tool to list them, "
+    "then pass `username` to any tool to pick one (omitted selects the only "
+    "stored account; with several stored, omitting it is an error that lists "
+    "them). Credentials expire - refresh them with a HAR capture (see the "
+    "x2llm README). All tools are read-only except "
     "like_tweet, which performs a REAL, publicly visible action and notifies "
     "the author - never call it unless the user explicitly asked to like that "
     "specific post. search supports X operators (from:user, "
@@ -126,31 +133,43 @@ MCP_TOOLS = [
     ),
 ]
 
-_MCP_CLIENT: XClient | None = None
+_MCP_CLIENTS: dict[str, XClient] = {}
 _MCP_LOCK = asyncio.Lock()
 
+_USERNAME_PARAM = inspect.Parameter(
+    "username", inspect.Parameter.POSITIONAL_OR_KEYWORD, default=None, annotation="str | None"
+)
+_USERNAME_HELP = (
+    " username: stored account to act as - omit to use the only stored "
+    "account; see the accounts tool."
+)
 
-async def mcp_client() -> XClient:
-    global _MCP_CLIENT
+
+async def mcp_client(username: str | None = None) -> XClient:
+    """One cached XClient per account; rebuilt when a refresh changes its row."""
+    config = Config.load(username)
     async with _MCP_LOCK:
-        if _MCP_CLIENT is None:
-            try:
-                _MCP_CLIENT = XClient(Config.from_env())
-            except ConfigError as e:
-                raise RuntimeError(str(e)) from e
-        return _MCP_CLIENT
+        client = _MCP_CLIENTS.get(config.screen_name)
+        if client is None or client.config != config:
+            client = XClient(config)
+            _MCP_CLIENTS[config.screen_name] = client
+        return client
+
+
+async def _list_accounts() -> dict:
+    return {"accounts": store.list_accounts()}
 
 
 def bind_tool(fn):
     sig = inspect.signature(fn)
-    params = list(sig.parameters.values())[1:]
+    params = [*list(sig.parameters.values())[1:], _USERNAME_PARAM]
 
-    async def bound(**kwargs):
+    async def bound(username=None, **kwargs):
         from mcp.server.mcpserver.exceptions import ToolError
 
         try:
-            return await fn(await mcp_client(), **kwargs)
-        except XApiError as e:
+            return await fn(await mcp_client(username), **kwargs)
+        except (ConfigError, XApiError) as e:
             raise ToolError(str(e)) from e
         except TypeError as e:
             raise ToolError(f"bad arguments: {e}") from e
@@ -168,9 +187,18 @@ def build_mcp_server():
         server.add_tool(
             bind_tool(fn),
             name=name,
-            description=description,
+            description=description + _USERNAME_HELP,
             annotations=ToolAnnotations(read_only_hint=read_only),
         )
+    server.add_tool(
+        _list_accounts,
+        name="accounts",
+        description=(
+            "List stored x.com accounts (screen name + last refresh time; "
+            "never credentials). Pass a tool's username parameter to select one."
+        ),
+        annotations=ToolAnnotations(read_only_hint=True),
+    )
     return server
 
 
@@ -179,5 +207,6 @@ async def serve() -> None:
     try:
         await server.run_stdio_async()
     finally:
-        if _MCP_CLIENT is not None:
-            await _MCP_CLIENT.aclose()
+        for client in _MCP_CLIENTS.values():
+            await client.aclose()
+        _MCP_CLIENTS.clear()

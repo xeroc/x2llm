@@ -1,30 +1,39 @@
 #!/usr/bin/env python3
 """Harvest wire constants and session credentials from browser HAR captures.
 
-Usage: uv run python scripts/har_to_endpoints.py archive1.har [archive2.har ...]
+Usage: uv run python scripts/har_to_endpoints.py [--user NAME] a.har [b.har ...]
 
-Two outputs, neither of which touches tracked source:
+Two outputs, one per nature of the data:
 
 - registry.new.py (repo root, gitignored): the updated wire-constant
-  registry, plus a unified diff against src/x2llm/registry.py. Review the
-  diff, then move the file over: `mv registry.new.py src/x2llm/registry.py`.
-  Constants are public, session-independent data (query ids, features blobs,
-  fieldToggles - from x.com's JS bundles). Merge is incremental: entries in
-  the given HARs win; operations they don't contain keep the registry's
+  registry (query ids, features blobs, fieldToggles - public, global data
+  from x.com's JS bundles), plus a unified diff against
+  src/x2llm/registry.py. Review the diff, then move the file over:
+  `mv registry.new.py src/x2llm/registry.py`. Merge is incremental: entries
+  in the given HARs win; operations they don't contain keep the registry's
   current values.
 
-- .env.fresh (repo root, gitignored): live session secrets - X_AUTH_TOKEN,
-  X_CT0 and X_TXIDS (one x-client-transaction-id per operation; the pool is
-  shared across endpoints and expires within ~1h). Never touches an
-  existing .env; review and `cp .env.fresh .env`.
+- the local account db (platformdirs user data dir): the harvested account's
+  live session material - auth_token, ct0, bearer, cookie, user_agent and
+  the txid pool (shared across endpoints, expires within ~1h). The account
+  is identified by a live call to x.com (whoami) unless --user NAME skips
+  the check (offline fallback); one account per run - HARs from the first
+  session found win.
 """
 from __future__ import annotations
 
+import argparse
+import asyncio
 import difflib
 import json
 import sys
 import urllib.parse
 from pathlib import Path
+
+from x2llm import store
+from x2llm.client import XClient
+from x2llm.config import DEFAULT_USER_AGENT, Config
+from x2llm.registry import BEARER as REGISTRY_BEARER
 
 ROOT = Path(__file__).resolve().parents[1]
 READS = {
@@ -47,13 +56,14 @@ def load_registry(path: Path) -> tuple[dict, str]:
     exec(path.read_text(), namespace)  # noqa: S102 - our own tracked source file
     return dict(namespace.get("GRAPHQL") or {}), namespace.get("BEARER") or ""
 
-
 def render(graphql: dict, bearer: str) -> str:
     return (
         "# Wire constants for x.com GraphQL operations. Plain source code: review\n"
         "# changes like any other file. `make refresh HAR=...` proposes updates to\n"
-        "# this file (registry.new.py + diff) from a browser capture - public\n"
-        "# constants only; session-scoped values live in env vars (X_TXIDS etc.).\n"
+        "# this file (registry.new.py + diff) from a browser capture - public,\n"
+        "# account-independent constants only; session-scoped values live in the\n"
+        "# local account db (store.py). The bearer here is the public web-client\n"
+        "# token: a boot default, overridden by each stored account's harvested one.\n"
         f"BEARER = {bearer!r}\n"
         f"GRAPHQL = {graphql!r}\n"
     )
@@ -138,13 +148,72 @@ def build(paths: list[str], registry: Path) -> tuple[dict, str, dict[str, str], 
             txids[key] = newest_tx
     return graphql, bearer, txids, material, set(harvested), previous
 
+def identify(material: dict[str, str], txids: dict[str, str], bearer: str) -> str | None:
+    """Ask x.com who these cookies belong to. None = unusable session."""
+
+    async def whoami() -> dict:
+        client = XClient(
+            Config(
+                screen_name="?",
+                auth_token=material["auth_token"],
+                ct0=material["ct0"],
+                cookie=material.get("cookie") or None,
+                bearer=bearer,
+                user_agent=material.get("user_agent") or DEFAULT_USER_AGENT,
+                api_base="https://x.com/i/api",
+                timeout=20.0,
+                rate_per_min=0,
+                txids=txids,
+            )
+        )
+        try:
+            return await client.rest("/1.1/account/settings.json", {})
+        finally:
+            await client.aclose()
+
+    try:
+        return asyncio.run(whoami()).get("screen_name") or None
+    except Exception:  # noqa: BLE001 - any failure means "do not trust the session"
+        return None
+
+
+def store_capture(material: dict[str, str], txids: dict[str, str], user: str | None) -> str:
+    """Identify the account and upsert its session material. Returns screen name."""
+    screen_name = user
+    if not screen_name:
+        screen_name = identify(material, txids, REGISTRY_BEARER)
+        if not screen_name:
+            sys.exit(
+                "could not verify the captured session against x.com "
+                "(dead cookies?) - rerun with --user NAME to store anyway"
+            )
+    store.upsert_account(
+        screen_name=screen_name,
+        auth_token=material["auth_token"],
+        ct0=material["ct0"],
+        bearer=material.get("bearer", ""),
+        cookie=material.get("cookie", ""),
+        user_agent=material.get("user_agent", ""),
+        txids=txids,
+    )
+    return screen_name
+
 
 def main() -> int:
-    if len(sys.argv) < 2:
-        sys.exit(__doc__)
-    paths = sys.argv[1:]
+    ap = argparse.ArgumentParser(
+        description="Harvest wire constants and session credentials from HAR captures."
+    )
+    ap.add_argument("har", nargs="+", help="HAR file(s) - one logged-in account per run")
+    ap.add_argument(
+        "--user",
+        metavar="NAME",
+        default=None,
+        help="store under NAME without the live identity check (offline fallback)",
+    )
+    args = ap.parse_args()
+
     registry = ROOT / "src" / "x2llm" / "registry.py"
-    graphql, bearer, txids, material, fresh, previous = build(paths, registry)
+    graphql, bearer, txids, material, fresh, previous = build([*args.har], registry)
 
     new = ROOT / "registry.new.py"
     content = render(graphql, bearer)
@@ -158,16 +227,10 @@ def main() -> int:
           f"{sorted(previous - fresh) or 'none'})")
 
     if material.get("auth_token"):
-        env_out = ROOT / ".env.fresh"
-        env_out.write_text(
-            "# Generated by har_to_endpoints.py - live session secrets. Keep private.\n"
-            f"X_AUTH_TOKEN={material['auth_token']}\n"
-            f"X_CT0={material['ct0']}\n"
-            "X_TXIDS='" + json.dumps(txids, separators=(",", ":")) + "'\n"
-            f"# X_USER_AGENT={material['user_agent']}\n"
-            f"# X_COOKIE={material['cookie']}\n"
-        )
-        print(f"wrote {env_out} ({len(txids)} txids) - review and: cp .env.fresh .env")
+        screen_name = store_capture(material, txids, args.user)
+        print(f"db: stored account '{screen_name}' ({len(txids)} txids) -> {store.db_path()}")
+    else:
+        print("no session material in these HARs - registry proposal only")
     return 0
 
 

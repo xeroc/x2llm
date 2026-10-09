@@ -1,8 +1,10 @@
-"""Offline tests: config, RPC encapsulation (httpx.MockTransport), parsers,
-cores (FakeClient), CLI (CliRunner) and one stdio MCP roundtrip.
-No test touches the network."""
+"""Offline tests: store/config, RPC encapsulation (httpx.MockTransport), parsers,
+cores (FakeClient), CLI (CliRunner), HAR generator and one stdio MCP
+roundtrip. No test touches the network or the real account db.
+"""
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import subprocess
@@ -18,23 +20,138 @@ from x2llm import cli, cores, parse
 from x2llm.client import XApiError, XClient
 from x2llm.config import Config, ConfigError
 
-ENV = {"X_AUTH_TOKEN": "at", "X_CT0": "ct"}
-TX = {"X_TXIDS": '{"search": "STX", "like": "LTX"}'}
+# --- store (sqlite account db) ------------------------------------------------------
 
 
-# --- config -------------------------------------------------------------------
+@pytest.fixture()
+def db(tmp_path, monkeypatch):
+    from x2llm import store
+
+    monkeypatch.setattr(store, "db_path", lambda: tmp_path / "accounts.db")
+    return store
 
 
-def test_config_missing_vars_lists_both():
-    with pytest.raises(ConfigError, match="X_AUTH_TOKEN, X_CT0"):
-        Config.from_env({})
+def _seed(db, name="fabian", **kw):
+    db.upsert_account(
+        screen_name=name,
+        auth_token=kw.get("auth_token", "at"),
+        ct0=kw.get("ct0", "ct"),
+        bearer=kw.get("bearer", "Bearer BB"),
+        cookie=kw.get("cookie", "auth_token=at; ct0=ct"),
+        user_agent=kw.get("user_agent", "UA"),
+        txids=kw.get("txids", {"search": "STX"}),
+    )
 
 
-def test_config_cookie_composition_and_override():
-    cfg = Config.from_env(ENV)
+def test_store_roundtrip_and_case_folding(db):
+    _seed(db, "Fabian")
+    row = db.get_account("FABIAN")
+    assert row["screen_name"] == "fabian"
+    assert row["auth_token"] == "at" and row["ct0"] == "ct"
+    assert row["bearer"] == "Bearer BB" and row["cookie"] == "auth_token=at; ct0=ct"
+    assert row["user_agent"] == "UA" and row["txids"] == {"search": "STX"}
+    assert row["updated_at"]
+
+
+def test_store_upsert_updates_in_place(db):
+    _seed(db, auth_token="old")
+    _seed(db, auth_token="new")
+    assert db.get_account("fabian")["auth_token"] == "new"
+    assert len(db.list_accounts()) == 1
+
+
+def test_store_perms(db):
+    import stat
+
+    _seed(db)
+    mode = db.db_path().stat().st_mode
+    assert stat.S_IMODE(mode) == 0o600
+    assert stat.S_IMODE(db.db_path().parent.stat().st_mode) == 0o700
+
+
+def test_store_rejects_bad_txids(db):
+    with pytest.raises(db.StoreError, match="txids"):
+        db.upsert_account(screen_name="x", auth_token="a", ct0="c", txids={"k": 1})
+
+
+def test_store_list_and_remove(db):
+    _seed(db, "a")
+    _seed(db, "b")
+    assert [a["screen_name"] for a in db.list_accounts()] == ["a", "b"]
+    assert db.list_accounts()[0]["updated_at"]
+    assert db.remove_account("A") is True
+    assert db.remove_account("a") is False
+    assert [a["screen_name"] for a in db.list_accounts()] == ["b"]
+
+
+def test_store_resolve_none(db):
+    with pytest.raises(db.StoreError, match="make refresh"):
+        db.resolve(None)
+    _seed(db)
+    assert db.resolve(None) == "fabian"
+    _seed(db, "other")
+    with pytest.raises(db.StoreError, match="fabian, other"):
+        db.resolve(None)
+
+
+def test_store_resolve_named(db):
+    _seed(db, "Fabian")
+    assert db.resolve("@fabian") == "fabian"
+    with pytest.raises(db.StoreError, match="no such account: nobody.*fabian"):
+        db.resolve("nobody")
+
+def mkconfig(**over) -> Config:
+    base: dict = {
+        "screen_name": "t",
+        "auth_token": "at",
+        "ct0": "ct",
+        "cookie": None,
+        "bearer": "Bearer A",
+        "user_agent": "UA",
+        "api_base": "https://x.com/i/api",
+        "timeout": 20.0,
+        "rate_per_min": 0,
+        "txids": {"search": "STX", "like": "LTX"},
+    }
+    base.update(over)
+    return Config(**base)
+
+
+def test_config_load_reads_db_and_env_knobs(db):
+    _seed(db, txids={"search": "STX"})
+    cfg = Config.load(
+        "fabian", env={"X_API_BASE": "http://x", "X_TIMEOUT": "5", "X_RATE_LIMIT": "0"}
+    )
+    assert cfg.screen_name == "fabian"
+    assert cfg.auth_token == "at" and cfg.ct0 == "ct" and cfg.txids == {"search": "STX"}
+    assert cfg.api_base == "http://x" and cfg.timeout == 5.0 and cfg.rate_per_min == 0
     assert cfg.cookie_header == "auth_token=at; ct0=ct"
-    cfg = Config.from_env({**ENV, "X_COOKIE": "auth_token=at; ct0=ct; cf_clearance=x"})
-    assert cfg.cookie_header.startswith("auth_token=at; ct0=ct; cf_clearance=")
+
+
+def test_config_load_defaults_and_bearer_fallback(db):
+    from x2llm.registry import BEARER
+
+    _seed(db, bearer="", cookie="", user_agent="")
+    cfg = Config.load(None)
+    assert cfg.bearer == BEARER and cfg.user_agent
+    assert cfg.api_base == "https://x.com/i/api"
+    assert cfg.timeout == 20 and cfg.rate_per_min == 30
+
+
+def test_config_load_cookie_override(db):
+    _seed(db, cookie="auth_token=at; ct0=ct; cf_clearance=x")
+    assert Config.load("fabian").cookie_header.startswith("auth_token=at; ct0=ct; cf_clearance=")
+
+
+def test_config_unknown_account_lists_stored(db):
+    _seed(db, "fabian")
+    with pytest.raises(ConfigError, match="no such account: nobody.*fabian"):
+        Config.load("nobody")
+
+
+def test_config_empty_store_points_at_refresh(db):
+    with pytest.raises(ConfigError, match="make refresh"):
+        Config.load(None)
 
 
 # --- client / RPC layer --------------------------------------------------------
@@ -48,7 +165,7 @@ def test_client_graphql_builds_request_and_headers():
         seen["headers"] = dict(request.headers)
         return httpx.Response(200, json={"data": {}})
 
-    client = XClient(Config.from_env({**ENV, **TX}), transport=httpx.MockTransport(handler))
+    client = XClient(mkconfig(), transport=httpx.MockTransport(handler))
     from x2llm.registry import GRAPHQL
 
     ep = GRAPHQL["search"]
@@ -72,14 +189,14 @@ def test_client_empty_404_hints_at_txid_expiry():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(404, content=b"")
 
-    client = XClient(Config.from_env(ENV), transport=httpx.MockTransport(handler))
+    client = XClient(mkconfig(txids={}), transport=httpx.MockTransport(handler))
     with pytest.raises(XApiError, match="transaction-id expired"):
         _run(client.graphql("search", {}))
 
 
 def test_client_403_hints_at_credentials():
     client = XClient(
-        Config.from_env(ENV), transport=httpx.MockTransport(lambda r: httpx.Response(403, json={}))
+        mkconfig(txids={}), transport=httpx.MockTransport(lambda r: httpx.Response(403, json={}))
     )
     with pytest.raises(XApiError, match="credentials rejected"):
         _run(client.rest("/1.1/search/typeahead.json", {"q": "x"}))
@@ -94,7 +211,7 @@ def test_client_mutation_posts_json_body_with_txid():
         seen["headers"] = dict(request.headers)
         return httpx.Response(200, json={"data": {"favorite_tweet": "Done"}})
 
-    client = XClient(Config.from_env({**ENV, **TX}), transport=httpx.MockTransport(handler))
+    client = XClient(mkconfig(), transport=httpx.MockTransport(handler))
     from x2llm.registry import GRAPHQL
 
     ep = GRAPHQL["like"]
@@ -279,7 +396,7 @@ def test_user_core_not_found_raises():
 
 def test_rate_limiter_spaces_requests():
     import time as time_mod
-    cfg = Config.from_env({**ENV, "X_RATE_LIMIT": "600"})
+    cfg = mkconfig(rate_per_min=600)
     client = XClient(cfg, transport=httpx.MockTransport(lambda r: httpx.Response(200, json={})))
     start = time_mod.monotonic()
     _run(client.rest("/1.1/x", {}))
@@ -289,7 +406,7 @@ def test_rate_limiter_spaces_requests():
 
 def test_rate_limiter_disabled_passes_through():
     import time as time_mod
-    cfg = Config.from_env({**ENV, "X_RATE_LIMIT": "0"})
+    cfg = mkconfig(rate_per_min=0)
     client = XClient(cfg, transport=httpx.MockTransport(lambda r: httpx.Response(200, json={})))
     start = time_mod.monotonic()
     _run(client.rest("/1.1/x", {}))
@@ -350,9 +467,10 @@ def test_like_core_surfaces_graphql_error():
 # --- CLI ---------------------------------------------------------------------------
 
 
-def test_cli_search_json_out(monkeypatch):
+def test_cli_search_json_out(monkeypatch, db):
+    _seed(db)
     monkeypatch.setattr(cli, "XClient", lambda cfg: FakeGraphClient())
-    result = CliRunner().invoke(cli.cli, ["search", "python"], env={**ENV, "PATH": os.environ["PATH"]})
+    result = CliRunner().invoke(cli.cli, ["search", "python"])
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     assert payload["tweets"][0]["id"] == "1"
@@ -375,18 +493,51 @@ class FakeGraphClient:
         pass
 
 
-def test_cli_missing_env_is_error():
-    result = CliRunner().invoke(cli.cli, ["badges"], env={"X_AUTH_TOKEN": "", "X_CT0": ""})
+def test_cli_no_account_is_error(db):
+    result = CliRunner().invoke(cli.cli, ["badges"])
     assert result.exit_code == 1
-    assert "X_AUTH_TOKEN" in json.loads(result.output)["error"]
+    assert "make refresh" in json.loads(result.output)["error"]
 
+
+def test_cli_user_flag_selects_account(monkeypatch, db):
+    seen_configs = []
+    monkeypatch.setattr(cli, "XClient", lambda cfg: (seen_configs.append(cfg), FakeGraphClient())[1])
+    _seed(db, "fabian")
+    _seed(db, "other")
+    result = CliRunner().invoke(cli.cli, ["-u", "OTHER", "search", "x"])
+    assert result.exit_code == 0, result.output
+    assert seen_configs[0].screen_name == "other"
+
+
+def test_cli_ambiguous_account_lists_names(db):
+    _seed(db, "fabian")
+    _seed(db, "other")
+    result = CliRunner().invoke(cli.cli, ["badges"])
+    assert result.exit_code == 1
+    assert "fabian, other" in json.loads(result.output)["error"]
+
+
+def test_cli_accounts_list_and_remove(db):
+    _seed(db, "fabian")
+    result = CliRunner().invoke(cli.cli, ["accounts", "list"])
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["accounts"][0]["screen_name"] == "fabian"
+    assert "updated_at" in payload["accounts"][0]
+
+    result = CliRunner().invoke(cli.cli, ["accounts", "remove", "FABIAN"], input="y\n")
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output[result.output.index("{") :]) == {"removed": "fabian"}
+
+    result = CliRunner().invoke(cli.cli, ["accounts", "remove", "ghost"], input="y\n")
+    assert result.exit_code == 1
+    assert "no such account" in json.loads(result.output[result.output.index("{") :])["error"]
 
 # --- MCP stdio roundtrip ------------------------------------------------------------
 
 
 def test_mcp_server_stdio_roundtrip():
     env = {k: v for k, v in os.environ.items() if not k.startswith("X_")}
-    env.update(ENV)
     proc = subprocess.Popen(
         [sys.executable, "-m", "x2llm", "mcp"],
         stdin=subprocess.PIPE,
@@ -408,13 +559,37 @@ def test_mcp_server_stdio_roundtrip():
             proc.stdin.write(json.dumps(r) + "\n")
         proc.stdin.flush()
         replies = [json.loads(proc.stdout.readline()) for _ in range(2)]
-        tools = [t["name"] for t in replies[1]["result"]["tools"]]
+        tools = {t["name"]: t for t in replies[1]["result"]["tools"]}
         assert replies[0]["result"]["serverInfo"]["name"] == "x2llm"
-        assert "search" in tools and "get_tweet" in tools and len(tools) == 12
+        assert len(tools) == 13
+        assert "accounts" in tools and "search" in tools and "get_tweet" in tools
+        assert "username" in tools["search"]["inputSchema"]["properties"]
+        assert tools["accounts"]["inputSchema"].get("properties") in (None, {})
     finally:
         proc.stdin.close()
         proc.terminate()
 
+
+def test_bind_tool_routes_username_to_client(monkeypatch, db):
+    from x2llm import mcp as mcp_mod
+
+    _seed(db, "fabian")
+    seen = {}
+
+    class BadgesClient:
+        async def graphql(self, key, variables):
+            return {"data": {"viewer_v2": {"user_results": {"result": {"badge_counts": {"dm": 1}}}}}}
+
+    async def fake_client(username=None):
+        seen["username"] = username
+        return BadgesClient()
+
+    monkeypatch.setattr(mcp_mod, "mcp_client", fake_client)
+    bound = mcp_mod.bind_tool(cores.badges)
+    assert "username" in inspect.signature(bound).parameters
+    result = _run(bound(username="fabian"))
+    assert seen["username"] == "fabian"
+    assert result == {"badges": {"dm": 1}}
 
 # --- helper ---------------------------------------------------------------------
 
@@ -480,3 +655,42 @@ def test_generator_fails_when_still_incomplete(tmp_path):
     har.write_text(json.dumps(_mini_har("SearchTimeline", "NEWQID", "NEWTX")))
     with pytest.raises(SystemExit, match="missing operations"):
         gen.build([str(har)], tmp_path / "registry.py")
+
+
+MATERIAL = {
+    "auth_token": "at",
+    "ct0": "ct",
+    "bearer": "Bearer BB",
+    "cookie": "auth_token=at; ct0=ct",
+    "user_agent": "UA",
+}
+
+
+def test_store_capture_identifies_then_upserts(monkeypatch):
+    gen = _load_generator()
+    calls = {}
+    monkeypatch.setattr(gen, "identify", lambda m, t, b: "Fabian")
+    monkeypatch.setattr(gen.store, "upsert_account", lambda **kw: calls.update(kw))
+    assert gen.store_capture(MATERIAL, {"search": "T"}, None) == "Fabian"
+    assert calls["screen_name"] == "Fabian" and calls["auth_token"] == "at"
+    assert calls["bearer"] == "Bearer BB" and calls["txids"] == {"search": "T"}
+
+
+def test_store_capture_user_flag_skips_lookup(monkeypatch):
+    gen = _load_generator()
+    calls = {}
+
+    def boom(*a):
+        raise AssertionError("identify must not run with --user")
+
+    monkeypatch.setattr(gen, "identify", boom)
+    monkeypatch.setattr(gen.store, "upsert_account", lambda **kw: calls.update(kw))
+    assert gen.store_capture(MATERIAL, {}, "offline") == "offline"
+    assert calls["screen_name"] == "offline"
+
+
+def test_store_capture_dead_session_exits(monkeypatch):
+    gen = _load_generator()
+    monkeypatch.setattr(gen, "identify", lambda *a: None)
+    with pytest.raises(SystemExit, match="--user"):
+        gen.store_capture(MATERIAL, {}, None)

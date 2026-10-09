@@ -7,7 +7,7 @@ from collections.abc import Awaitable, Callable
 
 import click
 
-from . import cores
+from . import cores, store
 from .client import XApiError, XClient
 from .config import Config, ConfigError
 
@@ -16,8 +16,8 @@ def out(obj) -> None:
     print(json.dumps(obj, default=str, ensure_ascii=False, indent=1))
 
 
-async def _run(make_coro: Callable[[XClient], Awaitable]) -> object:
-    config = Config.from_env()
+async def _run(make_coro: Callable[[XClient], Awaitable], username: str | None) -> object:
+    config = Config.load(username)
     client = XClient(config)
     try:
         return await make_coro(client)
@@ -26,8 +26,9 @@ async def _run(make_coro: Callable[[XClient], Awaitable]) -> object:
 
 
 def invoke(make_coro) -> None:
+    username = (click.get_current_context().obj or {}).get("username")
     try:
-        result = asyncio.run(_run(make_coro))
+        result = asyncio.run(_run(make_coro, username))
     except (ConfigError, XApiError) as e:
         out({"error": str(e)})
         raise SystemExit(1) from None
@@ -36,9 +37,17 @@ def invoke(make_coro) -> None:
 
 @click.group()
 @click.version_option()
-def cli() -> None:
+@click.option(
+    "-u",
+    "--user",
+    "username",
+    metavar="NAME",
+    default=None,
+    help="Account to act as (default: the only stored account; see `x2llm accounts list`).",
+)
+def cli(username: str | None) -> None:
     """x2llm - read-only x.com (Twitter) API client for agents. JSON out."""
-
+    click.get_current_context().obj = {"username": username}
 
 @cli.command()
 @click.option("--limit", type=int, default=20, show_default=True)
@@ -147,6 +156,32 @@ def post(text: str, reply_to: str | None) -> None:
 def like(tweet_id: str) -> None:
     """Like a tweet. REAL action: publicly visible, notifies the author."""
     invoke(lambda c: cores.like(c, tweet_id))
+
+
+@cli.group()
+def accounts() -> None:
+    """Manage stored x.com accounts (credentials live in a local sqlite db)."""
+
+
+@accounts.command("list")
+def accounts_list() -> None:
+    """Show stored screen names and when each was last refreshed."""
+    out({"accounts": store.list_accounts()})
+
+
+@accounts.command()
+@click.argument("name")
+@click.confirmation_option(prompt="Remove this account's stored credentials?")
+def remove(name: str) -> None:
+    """Remove NAME's credentials from the local account db."""
+    try:
+        if not store.remove_account(name):
+            stored = ", ".join(a["screen_name"] for a in store.list_accounts()) or "none stored"
+            raise store.StoreError(f"no such account: {name} (stored: {stored})")
+    except store.StoreError as e:
+        out({"error": str(e)})
+        raise SystemExit(1) from None
+    out({"removed": name.lstrip("@").lower()})
 
 
 if __name__ == "__main__":

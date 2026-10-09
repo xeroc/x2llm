@@ -8,14 +8,15 @@ Everything above this layer deals in plain dicts. Three primitives:
 
 Auth = public web bearer + cookie session (auth_token + ct0) + x-csrf-token
 mirroring ct0. Some endpoints additionally validate x-client-transaction-id
-(per operation in the X_TXIDS env var, path-bound, expire server-side).
+(per operation, from the account store; path-bound, expire server-side).
 
 A client-side rate limiter spaces requests at most X_RATE_LIMIT per minute
 (default 30, 0 disables) so the tool stays inside power-user territory.
 
 Transaction ids (x-client-transaction-id) are minted on demand by TxidFactory
 (txgen.py) - two anonymous fetches of x.com's public page, then pure CPU.
-Manual entries in the X_TXIDS env var override the generator per operation.
+Manual entries in the account store's txids column override the generator
+per operation.
 """
 from __future__ import annotations
 
@@ -93,7 +94,7 @@ class XClient:
         return self._json(response, path)
 
     async def _txid(self, key, method, path):
-        """Manual X_TXIDS entry wins; otherwise mint fresh (only some
+        """A manual txids entry wins; otherwise mint fresh (only some
         endpoints validate txids - search, like)."""
         manual = self.config.txids.get(key)
         if manual:
@@ -140,14 +141,14 @@ class XClient:
             if response.status_code == 404 and not response.content:
                 hint = (
                     " | hint: empty 404 usually means this endpoint's "
-                    "x-client-transaction-id expired - refresh X_TXIDS from a "
-                    "fresh capture (README - Refreshing captured tokens)"
+                    "x-client-transaction-id expired - re-capture and "
+                    "`make refresh` (README - Refreshing captured tokens)"
                 )
             elif response.status_code in (401, 403):
                 hint = (
-                    " | hint: credentials rejected - check X_AUTH_TOKEN / X_CT0, "
-                    "or set X_COOKIE to the full browser Cookie header "
-                    "(incl. cf_clearance)"
+                    " | hint: credentials rejected - re-capture the browser "
+                    "session and `make refresh` (the harvest stores the full "
+                    "Cookie header incl. cf_clearance)"
                 )
             elif response.status_code == 429:
                 hint = " | hint: rate limited by x.com - slow down or raise the wait"
