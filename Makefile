@@ -9,8 +9,8 @@ help: ## Show available targets
 setup: ## Install dependencies into .venv (uv sync)
 	$(UV) sync
 
-install: ## Install x2llm system-wide via uv tool
-	$(UV) tool install --upgrade .
+install: ## Install/refresh x2llm system-wide via uv tool (force = same-version reinstalls too)
+	$(UV) tool install --upgrade --force .
 
 uninstall: ## Remove system-wide x2llm
 	$(UV) tool uninstall x2llm
