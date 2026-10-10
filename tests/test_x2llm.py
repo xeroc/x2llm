@@ -85,20 +85,64 @@ def test_store_list_and_remove(db):
 
 
 def test_store_resolve_none(db):
-    with pytest.raises(db.StoreError, match="make refresh"):
+    with pytest.raises(db.StoreError, match="x2llm import"):
         db.resolve(None)
     _seed(db)
-    assert db.resolve(None) == "fabian"
+    assert db.resolve(None) == "fabian"  # first import is the default
     _seed(db, "other")
-    with pytest.raises(db.StoreError, match="fabian, other"):
-        db.resolve(None)
+    assert db.resolve(None) == "fabian"  # ...and keeps it
 
 
 def test_store_resolve_named(db):
     _seed(db, "Fabian")
     assert db.resolve("@fabian") == "fabian"
-    with pytest.raises(db.StoreError, match="no such account: nobody.*fabian"):
-        db.resolve("nobody")
+
+
+def test_first_import_becomes_default(db):
+    assert db.get_default() is None
+    _seed(db, "fabian")
+    assert db.get_default() == "fabian"
+    _seed(db, "other")
+    assert db.get_default() == "fabian"  # second import does not steal it
+
+
+def test_set_default_validates_and_case_folds(db):
+    _seed(db, "Fabian")
+    _seed(db, "other")
+    db.set_default("FABIAN")
+    assert db.get_default() == "fabian"
+    assert db.resolve(None) == "fabian"
+    with pytest.raises(db.StoreError, match="no such account: ghost"):
+        db.set_default("ghost")
+
+
+def test_resolve_none_without_default_points_at_cli(db):
+    _seed(db, "a")
+    _seed(db, "b")
+    db.set_meta("default_account", "")  # simulate a dangling/removed default
+    with pytest.raises(db.StoreError, match="accounts default"):
+        db.resolve(None)
+
+
+def test_remove_default_clears_it(db):
+    _seed(db, "a")
+    _seed(db, "b")
+    db.set_default("a")
+    assert db.remove_account("a") is True
+    assert db.get_default() is None
+    with pytest.raises(db.StoreError, match="accounts default"):
+        db.resolve(None)
+    db.set_default("b")
+    assert db.resolve(None) == "b"
+
+
+def test_list_accounts_marks_default(db):
+    _seed(db, "a")
+    _seed(db, "b")
+    rows = {r["screen_name"]: r for r in db.list_accounts()}
+    assert rows["a"]["default"] is True and rows["b"]["default"] is False
+
+
 
 def mkconfig(**over) -> Config:
     base: dict = {
@@ -150,7 +194,7 @@ def test_config_unknown_account_lists_stored(db):
 
 
 def test_config_empty_store_points_at_refresh(db):
-    with pytest.raises(ConfigError, match="make refresh"):
+    with pytest.raises(ConfigError, match="x2llm import"):
         Config.load(None)
 
 
@@ -496,7 +540,7 @@ class FakeGraphClient:
 def test_cli_no_account_is_error(db):
     result = CliRunner().invoke(cli.cli, ["badges"])
     assert result.exit_code == 1
-    assert "make refresh" in json.loads(result.output)["error"]
+    assert "x2llm import" in json.loads(result.output)["error"]
 
 
 def test_cli_user_flag_selects_account(monkeypatch, db):
@@ -509,12 +553,30 @@ def test_cli_user_flag_selects_account(monkeypatch, db):
     assert seen_configs[0].screen_name == "other"
 
 
-def test_cli_ambiguous_account_lists_names(db):
+def test_cli_multiple_accounts_use_default(monkeypatch, db):
+    seen_configs = []
+    monkeypatch.setattr(cli, "XClient", lambda cfg: (seen_configs.append(cfg), FakeGraphClient())[1])
     _seed(db, "fabian")
     _seed(db, "other")
-    result = CliRunner().invoke(cli.cli, ["badges"])
+    result = CliRunner().invoke(cli.cli, ["search", "x"])
+    assert result.exit_code == 0, result.output
+    assert seen_configs[0].screen_name == "fabian"  # first import = default
+
+
+def test_cli_accounts_default_show_and_set(db):
+    _seed(db, "fabian")
+    _seed(db, "other")
+    result = CliRunner().invoke(cli.cli, ["accounts", "default"])
+    assert result.exit_code == 0
+    assert json.loads(result.output) == {"default": "fabian"}
+
+    result = CliRunner().invoke(cli.cli, ["accounts", "default", "OTHER"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output) == {"default": "other"}
+
+    result = CliRunner().invoke(cli.cli, ["accounts", "default", "ghost"])
     assert result.exit_code == 1
-    assert "fabian, other" in json.loads(result.output)["error"]
+    assert "no such account" in json.loads(result.output)["error"]
 
 
 def test_cli_accounts_list_and_remove(db):

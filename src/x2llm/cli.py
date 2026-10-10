@@ -41,9 +41,8 @@ def invoke(make_coro) -> None:
     "-u",
     "--user",
     "username",
-    metavar="NAME",
+    help="Account to act as (default: the default account; see `x2llm accounts default`).",
     default=None,
-    help="Account to act as (default: the only stored account; see `x2llm accounts list`).",
 )
 def cli(username: str | None) -> None:
     """x2llm - read-only x.com (Twitter) API client for agents. JSON out."""
@@ -181,6 +180,7 @@ def post(text: str, reply_to: str | None) -> None:
     invoke(lambda c: cores.post_tweet(c, text, reply_to=reply_to))
 
 
+
 @cli.command()
 @click.argument("tweet_id")
 def like(tweet_id: str) -> None:
@@ -197,6 +197,20 @@ def accounts() -> None:
 def accounts_list() -> None:
     """Show stored screen names and when each was last refreshed."""
     out({"accounts": store.list_accounts()})
+
+
+@accounts.command("default")
+@click.argument("name", required=False)
+def accounts_default(name: str | None) -> None:
+    """Show or set the default account (used when --user is omitted)."""
+    if name is None:
+        out({"default": store.get_default()})
+        return
+    try:
+        out({"default": store.set_default(name)})
+    except store.StoreError as e:
+        out({"error": str(e)})
+        raise SystemExit(1) from None
 
 
 @accounts.command()

@@ -1,7 +1,7 @@
 """Stdio MCP server exposing the same cores as the CLI (reads + like_tweet).
 
 Account selection is per tool call via the `username` parameter (omitted =
-the only stored account); the `accounts` tool lists what is stored.
+the default account); the `accounts` tool lists what is stored.
 """
 from __future__ import annotations
 
@@ -15,10 +15,10 @@ from .config import Config, ConfigError
 MCP_INSTRUCTIONS = (
     "Access to logged-in x.com (Twitter) accounts via the private web API. "
     "Accounts live in a local store: call the `accounts` tool to list them, "
-    "then pass `username` to any tool to pick one (omitted selects the only "
-    "stored account; with several stored, omitting it is an error that lists "
-    "them). Credentials expire - refresh them with a HAR capture (see the "
-    "x2llm README). All tools are read-only except "
+    "then pass `username` to any tool to pick one (omitted selects the "
+    "default account - the accounts tool marks it). Credentials expire - "
+    "refresh them with a HAR capture (see the x2llm README). "
+    "All tools are read-only except "
     "like_tweet, which performs a REAL, publicly visible action and notifies "
     "the author - never call it unless the user explicitly asked to like that "
     "specific post. search supports X operators (from:user, "

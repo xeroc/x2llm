@@ -105,9 +105,11 @@ Expected output:
 }
 ```
 
-See what is stored with `x2llm accounts list` (screen names + last refresh
-time — never secrets). Add more accounts by repeating the capture+refresh
-with another browser profile; remove with `x2llm accounts remove NAME`.
+See what is stored with `x2llm accounts list` (screen names, last refresh
+time, which one is the default). The first imported account becomes the
+default - the one used when `--user` is omitted; change it with
+`x2llm accounts default NAME`, remove an account with
+`x2llm accounts remove NAME`.
 
 ### 3. Install the CLI system-wide (optional)
 
@@ -209,14 +211,14 @@ infrastructure knobs:
 ## CLI Reference
 
 Every command accepts `-u/--user NAME` before the subcommand to pick the
-account (omit it to use the only stored account; with several stored,
-omitting is an error that lists them).
+account; omitted, the default account is used.
 
 
 | Command | Description |
 |---|---|
 | `x2llm import HAR [HAR…] [--user NAME]` | Import an account from a capture; identity from the capture (twid), `--user` verified live |
-| `x2llm accounts list` | Stored screen names + last refresh time |
+| `x2llm accounts list` | Stored screen names, last refresh, default flag |
+| `x2llm accounts default [NAME]` | Show or set the default account |
 | `x2llm accounts remove NAME` | Delete NAME's credentials (asks for confirmation) |
 | `x2llm home [--tab for_you\|following] [--limit N] [--cursor C]` | Home timeline; scroll with the returned cursor |
 | `x2llm badges` | Unread notification/DM counts — cheapest auth check |
@@ -244,9 +246,9 @@ uv run x2llm search "solana lang:en min_faves:100" --limit 10 --cursor 'DAACCgAC
 
 `x2llm mcp` speaks MCP over stdio with 13 tools — the same cores as the CLI,
 plus `accounts`. Account selection is per tool call: every tool takes an
-optional `username` parameter (omitted = the only stored account; with
-several stored, omitting it is an error that lists them — the agent calls
-`accounts`, then retries with an explicit `username`). Eleven tools are
+optional `username` parameter (omitted = the default account, marked by the
+`accounts` tool; an unset default is an error that says how to pick one —
+Eleven tools are
 annotated `read_only_hint` (`accounts`, `get_home_timeline`, `get_user`,
 `get_badges`, `me`, `suggest`, `search`, `get_tweet`, `get_notifications`,
 `get_analytics`, `get_following`); `like_tweet` and `post_tweet` are the
