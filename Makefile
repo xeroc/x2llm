@@ -26,7 +26,7 @@ fmt: ## Ruff autofix
 
 check: lint test ## Everything a change must pass
 
-refresh: ## Harvest HAR: propose registry.new.py + upsert account into local db
+refresh: ## Harvest HAR: registry.new.py proposal + upsert account (like `x2llm import`)
 	$(UV) run python scripts/har_to_endpoints.py '$(HAR)'
 
 clean: ## Remove caches

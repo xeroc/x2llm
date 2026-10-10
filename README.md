@@ -64,22 +64,28 @@ sqlite db (`~/.local/share/x2llm/accounts.db` on Linux; 0600, created on
 first write). Accounts get in via a HAR capture:
 
 1. Open `https://x.com` in your logged-in browser
-2. `F12` → **Network** tab, filter for `i/api`, then exercise the pages:
-   home timeline (both tabs), one search, one tweet, notifications,
-   analytics, one user profile, one like — the same tour as
-   [Refreshing captured tokens](#refreshing-captured-tokens)
+2. `F12` → **Network** tab, filter for `i/api`, then skim your timeline
+   (a fuller tour also refreshes wire constants — see
+   [Refreshing captured tokens](#refreshing-captured-tokens))
 3. Export HAR: Network ⚙️ gear → *Save all as HAR*
-4. Harvest:
+4. Import:
 
 ```bash
-make refresh HAR='../x.com_Archive [26-10-07 13-27-31].har'
+uv run x2llm import '../x.com_Archive [26-10-10 09-19-00].har'
 ```
 
-The run identifies the account by asking x.com who the captured cookies
-belong to (a live, read-only call), then upserts auth_token, ct0, bearer,
-cookie, user-agent and the transaction-id pool under that screen name.
-If the identity check fails you can force the key with
-`--user NAME` (offline fallback). One account per run.
+The account is identified from the capture itself: its `twid` session
+cookie carries your numeric user id, matched against user objects in the
+responses — no live call needed. Captures that never name the viewer are
+filed explicitly instead, and that name is then **verified** live against
+the capture's session id before anything is stored:
+
+```bash
+uv run x2llm import capture.har --user xer0c   # verified: name ↔ twid id
+```
+
+Imported material per account: auth_token, ct0, bearer, full cookie
+header, user-agent and the transaction-id pool. One account per run.
 
 Verify:
 
@@ -209,6 +215,7 @@ omitting is an error that lists them).
 
 | Command | Description |
 |---|---|
+| `x2llm import HAR [HAR…] [--user NAME]` | Import an account from a capture; identity from the capture (twid), `--user` verified live |
 | `x2llm accounts list` | Stored screen names + last refresh time |
 | `x2llm accounts remove NAME` | Delete NAME's credentials (asks for confirmation) |
 | `x2llm home [--tab for_you\|following] [--limit N] [--cursor C]` | Home timeline; scroll with the returned cursor |
@@ -310,12 +317,11 @@ mv registry.new.py src/x2llm/registry.py && make check
 # the account db was already updated in place - nothing to copy
 ```
 
-The run identifies which account the capture belongs to by asking x.com
-(`GET /1.1/account/settings.json`) with the freshly harvested cookies and
-upserts under that screen name — no way to file credentials under the wrong
-user. If that check cannot run (offline, or x.com having a moment) rerun
-with `--user NAME` to store anyway; dead cookies are refused otherwise.
-One account per run: capture each browser profile separately.
+The account half behaves exactly like `x2llm import`: identity comes from
+the capture's `twid` cookie (user objects in the responses), `--user NAME`
+files explicitly and is verified against the capture's session id — no way
+to file credentials under the wrong user. One account per run: capture
+each browser profile separately.
 
 While `search`/`like` are down, everything else keeps working — tweet,
 notifications, analytics, following, suggest, both home tabs and user lookups

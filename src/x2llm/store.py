@@ -46,7 +46,7 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
-def _canonical(name: str) -> str:
+def canonical(name: str) -> str:
     return name.lstrip("@").strip().lower()
 
 
@@ -80,7 +80,7 @@ def upsert_account(
             " cookie=excluded.cookie, user_agent=excluded.user_agent, txids=excluded.txids,"
             " updated_at=excluded.updated_at",
             (
-                _canonical(screen_name),
+                canonical(screen_name),
                 auth_token,
                 ct0,
                 bearer,
@@ -96,7 +96,7 @@ def get_account(screen_name: str) -> dict | None:
     with _connect() as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
-            "SELECT * FROM accounts WHERE screen_name = ?", (_canonical(screen_name),)
+            "SELECT * FROM accounts WHERE screen_name = ?", (canonical(screen_name),)
         ).fetchone()
     if row is None:
         return None
@@ -117,7 +117,7 @@ def list_accounts() -> list[dict]:
 
 def remove_account(screen_name: str) -> bool:
     with _connect() as conn:
-        cur = conn.execute("DELETE FROM accounts WHERE screen_name = ?", (_canonical(screen_name),))
+        cur = conn.execute("DELETE FROM accounts WHERE screen_name = ?", (canonical(screen_name),))
     return cur.rowcount > 0
 
 
@@ -128,7 +128,7 @@ def resolve(username: str | None) -> str:
     errors that tell the caller what to do next.
     """
     if username:
-        name = _canonical(username)
+        name = canonical(username)
         if not get_account(name):
             stored = ", ".join(_names()) or "none stored yet"
             raise StoreError(f"no such account: {username} (stored: {stored})")

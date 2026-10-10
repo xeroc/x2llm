@@ -536,6 +536,49 @@ def test_cli_accounts_list_and_remove(db):
 # --- MCP stdio roundtrip ------------------------------------------------------------
 
 
+def test_cli_import_identifies_and_stores(db, tmp_path, monkeypatch):
+    from x2llm import harvest
+
+    har = tmp_path / "cap.har"
+    har.write_text(json.dumps(_mini_har("SearchTimeline", "Q", "TX")))
+    identified = {**MATERIAL, "screen_name": "Xeroc"}
+    monkeypatch.setattr(
+        harvest, "harvest", lambda paths: ({"search": {}}, {"search": "T"}, identified)
+    )
+    result = CliRunner().invoke(cli.cli, ["import", str(har)])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["imported"] == "xeroc" and payload["txids"] >= 1
+    row = db.get_account("xeroc")
+    assert row["auth_token"] == "at" and row["ct0"] == "ct"
+
+
+def test_cli_import_user_flag_overrides(db, tmp_path):
+    har = tmp_path / "cap.har"
+    har.write_text(json.dumps(_mini_har("SearchTimeline", "Q", "TX")))
+    result = CliRunner().invoke(cli.cli, ["import", str(har), "--user", "xer0c"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["imported"] == "xer0c"
+
+
+def test_cli_import_without_cookies_is_error(db, tmp_path):
+    har = tmp_path / "dry.har"
+    entry = {"log": {"entries": [{"startedDateTime": "t", "request": {
+        "method": "GET", "url": "https://x.com/home", "headers": []}}]}}
+    har.write_text(json.dumps(entry))
+    result = CliRunner().invoke(cli.cli, ["import", str(har)])
+    assert result.exit_code == 1
+    assert "no session" in json.loads(result.output)["error"]
+
+
+def test_cli_import_unidentifiable_is_error(db, tmp_path):
+    har = tmp_path / "cap.har"
+    har.write_text(json.dumps(_mini_har("SearchTimeline", "Q", "TX")))  # no twid/user object
+    result = CliRunner().invoke(cli.cli, ["import", str(har)])
+    assert result.exit_code == 1
+    assert "--user" in json.loads(result.output)["error"]
+
+
 def test_mcp_server_stdio_roundtrip():
     env = {k: v for k, v in os.environ.items() if not k.startswith("X_")}
     proc = subprocess.Popen(
@@ -666,31 +709,78 @@ MATERIAL = {
 }
 
 
-def test_store_capture_identifies_then_upserts(monkeypatch):
-    gen = _load_generator()
-    calls = {}
-    monkeypatch.setattr(gen, "identify", lambda m, t, b: "Fabian")
-    monkeypatch.setattr(gen.store, "upsert_account", lambda **kw: calls.update(kw))
-    assert gen.store_capture(MATERIAL, {"search": "T"}, None) == "Fabian"
-    assert calls["screen_name"] == "Fabian" and calls["auth_token"] == "at"
-    assert calls["bearer"] == "Bearer BB" and calls["txids"] == {"search": "T"}
+def test_harvest_identifies_viewer_via_twid(tmp_path):
+    from x2llm import harvest as h
+
+    body = json.dumps(
+        {"data": {"users": [{"rest_id": "15904453", "core": {"screen_name": "Xeroc"}}]}}
+    )
+    har = {"log": {"entries": [{
+        "startedDateTime": "2026-10-10T09:00:00",
+        "request": {"method": "GET",
+                    "url": "https://x.com/i/api/graphql/X/ViewerBadgeCounts?variables=%7B%7D",
+                    "headers": [{"name": "cookie",
+                                 "value": "auth_token=a; ct0=c; twid=u%3D15904453"}]},
+        "response": {"content": {"text": body}},
+    }]}}
+    p = tmp_path / "id.har"
+    p.write_text(json.dumps(har))
+    _, _, material = h.harvest([str(p)])
+    assert material["viewer_id"] == "15904453"
+    assert material["screen_name"] == "Xeroc"
 
 
-def test_store_capture_user_flag_skips_lookup(monkeypatch):
-    gen = _load_generator()
-    calls = {}
+def test_store_capture_uses_capture_identity(db):
+    from x2llm import harvest
 
-    def boom(*a):
-        raise AssertionError("identify must not run with --user")
-
-    monkeypatch.setattr(gen, "identify", boom)
-    monkeypatch.setattr(gen.store, "upsert_account", lambda **kw: calls.update(kw))
-    assert gen.store_capture(MATERIAL, {}, "offline") == "offline"
-    assert calls["screen_name"] == "offline"
+    identified = {**MATERIAL, "screen_name": "Fabian"}
+    assert harvest.store_capture(identified, {"search": "T"}, None) == "fabian"
+    row = db.get_account("fabian")
+    assert row["auth_token"] == "at" and row["bearer"] == "Bearer BB"
+    assert row["txids"] == {"search": "T"}
 
 
-def test_store_capture_dead_session_exits(monkeypatch):
-    gen = _load_generator()
-    monkeypatch.setattr(gen, "identify", lambda *a: None)
-    with pytest.raises(SystemExit, match="--user"):
-        gen.store_capture(MATERIAL, {}, None)
+def test_store_capture_user_flag_wins(db):
+    from x2llm import harvest
+
+    identified = {**MATERIAL, "screen_name": "someoneelse"}
+    assert harvest.store_capture(identified, {}, "offline") == "offline"
+    assert db.get_account("offline")["auth_token"] == "at"
+
+
+def test_store_capture_unidentifiable_raises(db):
+    from x2llm import harvest
+    from x2llm.store import StoreError
+
+    with pytest.raises(StoreError, match="--user"):
+        harvest.store_capture(MATERIAL, {}, None)
+
+
+def _profile_transport(rest_id: str) -> httpx.MockTransport:
+    return httpx.MockTransport(
+        lambda r: httpx.Response(200, json={"data": {"user": {"result": {"rest_id": rest_id}}}})
+    )
+
+
+def test_verify_name_matches_and_mismatches():
+    from x2llm.harvest import verify_name
+
+    material = {**MATERIAL, "viewer_id": "15904453"}
+    assert verify_name(material, "xer0c", transport=_profile_transport("15904453")) is True
+    assert verify_name(material, "xer0c", transport=_profile_transport("42")) is False
+
+
+def test_verify_name_without_twid_is_none():
+    from x2llm.harvest import verify_name
+
+    assert verify_name(MATERIAL, "xer0c", transport=_profile_transport("15904453")) is None
+
+
+def test_store_capture_refuses_name_mismatch(db, monkeypatch):
+    from x2llm import harvest
+    from x2llm.store import StoreError
+
+    material = {**MATERIAL, "viewer_id": "15904453"}
+    monkeypatch.setattr(harvest, "verify_name", lambda m, n: False)
+    with pytest.raises(StoreError, match="mismatch"):
+        harvest.store_capture(material, {}, "xer0c")

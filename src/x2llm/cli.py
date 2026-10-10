@@ -134,6 +134,36 @@ def mcp() -> None:
     asyncio.run(serve())
 
 
+@cli.command("import")
+@click.argument("har_file", nargs=-1, required=True, type=click.Path(exists=True))
+@click.option(
+    "--user",
+    "username",
+    metavar="NAME",
+    default=None,
+    help="Store under NAME instead of the capture-derived identity.",
+)
+def import_account(har_file: tuple[str, ...], username: str | None) -> None:
+    """Import an account from HAR capture(s) into the local db.
+
+    The account is identified from the capture itself (its twid session
+    cookie matched against user objects in the responses) and stored under
+    that screen name. One account per run.
+    """
+    from . import harvest
+
+    try:
+        _, txids, material = harvest.harvest(list(har_file))
+        if not material.get("auth_token"):
+            raise store.StoreError("no session cookies in these HAR files (auth_token/ct0)")
+        txids = harvest.backfill_txids(txids, material.get("newest_tx", ""))
+        name = harvest.store_capture(material, txids, username)
+    except store.StoreError as e:
+        out({"error": str(e)})
+        raise SystemExit(1) from None
+    out({"imported": name, "txids": len(txids)})
+
+
 def main(argv: list[str] | None = None) -> int:
     try:
         cli(args=argv, standalone_mode=True)
