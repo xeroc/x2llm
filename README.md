@@ -3,7 +3,8 @@
 x.com (Twitter) client for LLM agents. Multiple accounts in a local sqlite
 store, three faces: a Python library, a `click` CLI, and a stdio MCP
 server. Built for machines first: every command prints exactly one JSON
-document, every error prints `{"error": "..."}` and exits non-zero. Everything
+document (`x2llm prime` is the one markdown exception - an agent briefing),
+every error prints `{"error": "..."}` and exits non-zero. Everything
 is read-only **except one deliberate write: `like`** — no posting, replying,
 following, or DMing.
 
@@ -220,6 +221,7 @@ account; omitted, the default account is used.
 | `x2llm accounts list` | Stored screen names, last refresh, default flag |
 | `x2llm accounts default [NAME]` | Show or set the default account |
 | `x2llm accounts remove NAME` | Delete NAME's credentials (asks for confirmation) |
+| `x2llm prime` | Agent briefing (markdown - the one non-JSON command): commands, examples, error fixes |
 | `x2llm home [--tab for_you\|following] [--limit N] [--cursor C]` | Home timeline; scroll with the returned cursor |
 | `x2llm badges` | Unread notification/DM counts — cheapest auth check |
 | `x2llm user SCREEN_NAME` | Profile lookup: bio, url, follower counts, verification |

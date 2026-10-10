@@ -163,6 +163,18 @@ def import_account(har_file: tuple[str, ...], username: str | None) -> None:
     out({"imported": name, "txids": len(txids)})
 
 
+
+@cli.command()
+def prime() -> None:
+    """Print an agent briefing (markdown): commands, examples, error fixes.
+
+    The one command that prints plain markdown instead of JSON.
+    """
+    from .prime import PRIME_MD
+
+    print(PRIME_MD)
+
+
 def main(argv: list[str] | None = None) -> int:
     try:
         cli(args=argv, standalone_mode=True)

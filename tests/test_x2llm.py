@@ -563,6 +563,24 @@ def test_cli_multiple_accounts_use_default(monkeypatch, db):
     assert seen_configs[0].screen_name == "fabian"  # first import = default
 
 
+
+
+def test_cli_prime_dumps_agent_briefing():
+    result = CliRunner().invoke(cli.cli, ["prime"])
+    assert result.exit_code == 0
+    doc = result.output
+    for section in ("agent briefing", "## Commands", "## Examples", "## REAL actions",
+                    "Error dictionary", "MCP server"):
+        assert section in doc
+    # doc-rot guard: every `x2llm <cmd>` referenced in the doc must exist
+    import re
+
+    referenced = set(re.findall(r"x2llm (-u NAME )?([a-z_]+)", doc))
+    cmds = set(cli.cli.commands)
+    for _, cmd in referenced:
+        assert cmd in cmds, f"prime references unknown command: {cmd}"
+
+
 def test_cli_accounts_default_show_and_set(db):
     _seed(db, "fabian")
     _seed(db, "other")
