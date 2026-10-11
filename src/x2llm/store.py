@@ -26,7 +26,6 @@ DEFAULT_KEY = "default_account"
 class StoreError(Exception):
     pass
 
-
 def db_path() -> Path:
     """Location of the account db. Uncached so tests can monkeypatch it."""
     return Path(user_data_dir("x2llm")) / "accounts.db"
@@ -49,9 +48,48 @@ def _connect() -> sqlite3.Connection:
         "updated_at  TEXT NOT NULL)"
     )
     conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS wire ("
+        "operation TEXT PRIMARY KEY,"
+        "entry     TEXT NOT NULL)"
+    )
+    try:  # migration for dbs created before the column existed
+        conn.execute("ALTER TABLE accounts ADD COLUMN txids_updated TEXT NOT NULL DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass  # column already there
     conn.commit()
     os.chmod(path, 0o600)
     return conn
+
+
+def upsert_wire(entries: dict[str, dict]) -> list[str]:
+    """Store harvested wire entries {operation: {query_id, name, method, ...}}.
+
+    Overrides the shipped defaults in registry.py per operation. Returns
+    the operations whose entry changed.
+    """
+    changed: list[str] = []
+    for op, entry in entries.items():
+        if not isinstance(entry, dict) or not entry.get("query_id") or not entry.get("name"):
+            raise StoreError(f"wire entry for '{op}' needs at least query_id and name")
+        with _connect() as conn:
+            row = conn.execute("SELECT entry FROM wire WHERE operation = ?", (op,)).fetchone()
+            if row is not None and json.loads(row[0]) == entry:
+                continue
+            conn.execute(
+                "INSERT INTO wire (operation, entry) VALUES (?, ?)"
+                " ON CONFLICT(operation) DO UPDATE SET entry=excluded.entry",
+                (op, json.dumps(entry, separators=(",", ":"))),
+            )
+            changed.append(op)
+    return sorted(changed)
+
+
+def get_wire() -> dict[str, dict]:
+    """Harvested wire overrides (merged over registry defaults by the client)."""
+    with _connect() as conn:
+        rows = conn.execute("SELECT operation, entry FROM wire").fetchall()
+    return {op: json.loads(entry) for op, entry in rows}
 
 
 def canonical(name: str) -> str:
@@ -103,6 +141,7 @@ def upsert_account(
     cookie: str = "",
     user_agent: str = "",
     txids: dict[str, str] | None = None,
+    txids_updated: str = "",
 ) -> None:
     if not screen_name or not auth_token or not ct0:
         raise StoreError("screen_name, auth_token and ct0 are required")
@@ -113,12 +152,13 @@ def upsert_account(
     with _connect() as conn:
         conn.execute(
             "INSERT INTO accounts"
-            " (screen_name, auth_token, ct0, bearer, cookie, user_agent, txids, updated_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            " (screen_name, auth_token, ct0, bearer, cookie, user_agent, txids,"
+            " updated_at, txids_updated)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
             " ON CONFLICT(screen_name) DO UPDATE SET"
             " auth_token=excluded.auth_token, ct0=excluded.ct0, bearer=excluded.bearer,"
             " cookie=excluded.cookie, user_agent=excluded.user_agent, txids=excluded.txids,"
-            " updated_at=excluded.updated_at",
+            " updated_at=excluded.updated_at, txids_updated=excluded.txids_updated",
             (
                 name,
                 auth_token,
@@ -128,6 +168,7 @@ def upsert_account(
                 user_agent,
                 json.dumps(txids, separators=(",", ":")),
                 datetime.now(UTC).isoformat(timespec="seconds"),
+                txids_updated,
             ),
         )
     if not get_default():  # the very first import becomes the default

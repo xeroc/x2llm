@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 import urllib.parse
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
@@ -40,8 +41,8 @@ def _seed(db, name="fabian", **kw):
         cookie=kw.get("cookie", "auth_token=at; ct0=ct"),
         user_agent=kw.get("user_agent", "UA"),
         txids=kw.get("txids", {"search": "STX"}),
+        txids_updated=kw.get("txids_updated", datetime.now(UTC).isoformat(timespec="seconds")),
     )
-
 
 def test_store_roundtrip_and_case_folding(db):
     _seed(db, "Fabian")
@@ -144,6 +145,19 @@ def test_list_accounts_marks_default(db):
 
 
 
+def test_wire_roundtrip_and_override(db):
+    db.upsert_wire({"search": {"query_id": "NEW", "name": "SearchTimeline", "method": "get"}})
+    wire = db.get_wire()
+    assert wire["search"]["query_id"] == "NEW"
+    db.upsert_wire({"search": {"query_id": "NEWER", "name": "SearchTimeline", "method": "get"}})
+    assert db.get_wire()["search"]["query_id"] == "NEWER"
+
+
+def test_wire_rejects_garbage(db):
+    with pytest.raises(db.StoreError, match="wire"):
+        db.upsert_wire({"search": {"no_query_id": True}})
+
+
 def mkconfig(**over) -> Config:
     base: dict = {
         "screen_name": "t",
@@ -193,6 +207,19 @@ def test_config_unknown_account_lists_stored(db):
         Config.load("nobody")
 
 
+def test_config_drops_stale_txid_pool(db):
+    import sqlite3
+
+
+
+    now = datetime.now(UTC).isoformat(timespec="seconds")
+    _seed(db, txids={"search": "STX"}, txids_updated=now)
+    assert Config.load("fabian").txids == {"search": "STX"}  # fresh capture keeps them
+    with sqlite3.connect(db.db_path()) as conn:
+        conn.execute("UPDATE accounts SET txids_updated = '2020-01-01T00:00:00+00:00'")
+    assert Config.load("fabian").txids == {}  # stale pool -> txgen takes over
+
+
 def test_config_empty_store_points_at_refresh(db):
     with pytest.raises(ConfigError, match="x2llm import"):
         Config.load(None)
@@ -201,7 +228,7 @@ def test_config_empty_store_points_at_refresh(db):
 # --- client / RPC layer --------------------------------------------------------
 
 
-def test_client_graphql_builds_request_and_headers():
+def test_client_graphql_builds_request_and_headers(db):
     seen = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -229,7 +256,7 @@ def test_client_graphql_builds_request_and_headers():
     assert h["x-client-transaction-id"] == "STX"
 
 
-def test_client_empty_404_hints_at_txid_expiry():
+def test_client_empty_404_hints_at_txid_expiry(db):
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(404, content=b"")
 
@@ -245,7 +272,7 @@ def test_client_403_hints_at_credentials():
     with pytest.raises(XApiError, match="credentials rejected"):
         _run(client.rest("/1.1/search/typeahead.json", {"q": "x"}))
 
-def test_client_mutation_posts_json_body_with_txid():
+def test_client_mutation_posts_json_body_with_txid(db):
     seen = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -268,6 +295,22 @@ def test_client_mutation_posts_json_body_with_txid():
     assert h["content-type"] == "application/json"
     assert h["x-csrf-token"] == "ct"
     assert h["x-client-transaction-id"] == "LTX"
+
+
+def test_client_wire_overrides_registry(db):
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json={"data": {}})
+
+    db.upsert_wire({"search": {"query_id": "DBQID", "name": "SearchTimeline", "method": "get"}})
+    client = XClient(mkconfig(), transport=httpx.MockTransport(handler))
+    _run(client.graphql("search", {}))
+    assert "DBQID" in seen["url"]
+    from x2llm.registry import GRAPHQL
+
+    assert client._op("tweet") == GRAPHQL["tweet"]
 
 
 # --- parsers --------------------------------------------------------------------
@@ -580,6 +623,37 @@ def test_cli_prime_dumps_agent_briefing():
     for _, cmd in referenced:
         assert cmd in cmds, f"prime references unknown command: {cmd}"
 
+def _mini_har(op, qid, txid, method="GET"):
+    url = f"https://x.com/i/api/graphql/{qid}/{op}?variables=%7B%7D&features=%7B%7D"
+    entry = {"startedDateTime": "2026-10-07T13:00:00",
+             "request": {"method": method, "url": url, "headers": [
+        {"name": "x-client-transaction-id", "value": txid},
+        {"name": "authorization", "value": "Bearer x"},
+        {"name": "cookie", "value": "auth_token=a; ct0=c"},
+    ]}}
+    if method == "POST":
+        entry["request"]["postData"] = {
+            "text": json.dumps({"variables": {}, "queryId": qid, "features": {}})}
+    return {"log": {"entries": [entry]}}
+
+
+def test_cli_import_identifies_and_stores(db, tmp_path, monkeypatch):
+    from x2llm import harvest
+
+    har = tmp_path / "cap.har"
+    har.write_text(json.dumps(_mini_har("SearchTimeline", "Q", "TX")))
+    identified = {**MATERIAL, "screen_name": "Xeroc"}
+    wire = {"search": {"query_id": "Q", "name": "SearchTimeline", "method": "get"}}
+    monkeypatch.setattr(
+        harvest, "harvest", lambda paths: (wire, {"search": "T"}, identified)
+    )
+    result = CliRunner().invoke(cli.cli, ["import", str(har)])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["imported"] == "xeroc" and payload["txids"] >= 1
+    assert payload["wire_updated"] == ["search"]
+    assert db.get_wire()["search"]["query_id"] == "Q"
+
 
 def test_cli_accounts_default_show_and_set(db):
     _seed(db, "fabian")
@@ -615,22 +689,6 @@ def test_cli_accounts_list_and_remove(db):
 
 # --- MCP stdio roundtrip ------------------------------------------------------------
 
-
-def test_cli_import_identifies_and_stores(db, tmp_path, monkeypatch):
-    from x2llm import harvest
-
-    har = tmp_path / "cap.har"
-    har.write_text(json.dumps(_mini_har("SearchTimeline", "Q", "TX")))
-    identified = {**MATERIAL, "screen_name": "Xeroc"}
-    monkeypatch.setattr(
-        harvest, "harvest", lambda paths: ({"search": {}}, {"search": "T"}, identified)
-    )
-    result = CliRunner().invoke(cli.cli, ["import", str(har)])
-    assert result.exit_code == 0, result.output
-    payload = json.loads(result.output)
-    assert payload["imported"] == "xeroc" and payload["txids"] >= 1
-    row = db.get_account("xeroc")
-    assert row["auth_token"] == "at" and row["ct0"] == "ct"
 
 
 def test_cli_import_user_flag_overrides(db, tmp_path):
@@ -724,60 +782,9 @@ def _run(coro):
 
 
 # --- generator (incremental merge) ------------------------------------------------
-
-
-def _load_generator():
-    import importlib.util
-    spec = importlib.util.spec_from_file_location(
-        "har_to_endpoints", Path(__file__).resolve().parents[1] / "scripts" / "har_to_endpoints.py")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-def _mini_har(op, qid, txid, method="GET"):
-    url = f"https://x.com/i/api/graphql/{qid}/{op}?variables=%7B%7D&features=%7B%7D"
-    entry = {"startedDateTime": "2026-10-07T13:00:00",
-             "request": {"method": method, "url": url, "headers": [
-        {"name": "x-client-transaction-id", "value": txid},
-        {"name": "authorization", "value": "Bearer x"},
-        {"name": "cookie", "value": "auth_token=a; ct0=c"},
-    ]}}
-    if method == "POST":
-        entry["request"]["postData"] = {
-            "text": json.dumps({"variables": {}, "queryId": qid, "features": {}})}
-    return {"log": {"entries": [entry]}}
-
-
-def test_generator_merges_incrementally_without_writing_source(tmp_path):
-    gen = _load_generator()
-    registry = tmp_path / "registry.py"
-    seed = {key: {"query_id": f"OLD{key}", "name": name, "method": "get"}
-            for key, name in [("search", "SearchTimeline"), ("tweet", "TweetDetail"),
-                              ("notifications", "NotificationsTimeline"), ("badges", "ViewerBadgeCounts"),
-                              ("analytics", "accountOverviewDailyQuery"), ("user", "UserByScreenName"),
-                              ("home", "HomeTimeline"), ("home_following", "HomeLatestTimeline"),
-                              ("like", "FavoriteTweet"), ("create_tweet", "CreateTweet")]}
-    seed["tweet"] = {"query_id": "K", "name": "TweetDetail", "method": "get"}
-    registry.write_text(gen.render(seed, "Bearer x"))
-    har = tmp_path / "mini.har"
-    har.write_text(json.dumps(_mini_har("SearchTimeline", "NEWQID", "NEWTX")))
-    graphql, bearer, _txids, _material, fresh, previous = gen.build([str(har)], registry)
-    content = gen.render(graphql, bearer)
-    assert graphql["search"]["query_id"] == "NEWQID"
-    assert "txid" not in content  # session data never ships in source
-    assert graphql["tweet"]["query_id"] == "K"
-    assert fresh == {"search"} and "tweet" in previous
-    # and the registry file itself was NOT rewritten
-    assert "NEWQID" not in registry.read_text()
-
-
-def test_generator_fails_when_still_incomplete(tmp_path):
-    gen = _load_generator()
-    har = tmp_path / "mini.har"
-    har.write_text(json.dumps(_mini_har("SearchTimeline", "NEWQID", "NEWTX")))
-    with pytest.raises(SystemExit, match="missing operations"):
-        gen.build([str(har)], tmp_path / "registry.py")
+# --- generator (incremental merge) - retired with scripts/har_to_endpoints.py ----
+# wire entries now go straight into the db via `x2llm import`; see
+# test_cli_import_identifies_and_stores and test_wire_roundtrip_and_override.
 
 
 MATERIAL = {

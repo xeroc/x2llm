@@ -26,8 +26,9 @@ import time
 
 import httpx
 
+from . import store
 from .config import Config
-from .registry import GRAPHQL
+from .registry import GRAPHQL as DEFAULT_GRAPHQL
 from .txgen import TxidFactory
 
 
@@ -35,7 +36,6 @@ class XApiError(Exception):
     def __init__(self, message: str, status: int | None = None):
         super().__init__(message)
         self.status = status
-
 
 class XClient:
     def __init__(self, config: Config, transport: httpx.AsyncBaseTransport | None = None):
@@ -45,15 +45,22 @@ class XClient:
         self._rl_lock = asyncio.Lock()
         self._next_slot = 0.0
         self._txgen = None
+        self._graphql: dict | None = None  # defaults merged with db wire, built lazily
+
+    def _op(self, key: str) -> dict:
+        """Registry defaults overridden per operation by harvested wire data."""
+        if self._graphql is None:
+            self._graphql = {**DEFAULT_GRAPHQL, **store.get_wire()}
+        return self._graphql[key]
 
     async def aclose(self) -> None:
         await self._http.aclose()
         if self._txgen is not None:
             await self._txgen.aclose()
 
+
     async def graphql(self, key: str, variables: dict) -> dict:
-        """Read: GET with variables (+ per-endpoint features/fieldToggles) in the query string."""
-        ep = GRAPHQL[key]
+        ep = self._op(key)
         params = {"variables": json.dumps(variables, separators=(",", ":"))}
         if ep.get("features"):
             params["features"] = json.dumps(ep["features"], separators=(",", ":"))
@@ -71,7 +78,7 @@ class XClient:
     async def graphql_post(self, key: str, variables: dict) -> dict:
         """POST GraphQL: body carries variables+queryId (+features/fieldToggles
         from the registry). Used for POST-fed timelines (home) and the like write."""
-        ep = GRAPHQL[key]
+        ep = self._op(key)
         body = {"variables": variables, "queryId": ep["query_id"]}
         if ep.get("features"):
             body["features"] = ep["features"]
@@ -142,12 +149,12 @@ class XClient:
                 hint = (
                     " | hint: empty 404 usually means this endpoint's "
                     "x-client-transaction-id expired - re-capture and "
-                    "`make refresh` (README - Refreshing captured tokens)"
+                    "`x2llm import` (README - Refreshing captured tokens)"
                 )
             elif response.status_code in (401, 403):
                 hint = (
                     " | hint: credentials rejected - re-capture the browser "
-                    "session and `make refresh` (the harvest stores the full "
+                    "session and `x2llm import` (the harvest stores the full "
                     "Cookie header incl. cf_clearance)"
                 )
             elif response.status_code == 429:

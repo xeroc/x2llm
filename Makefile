@@ -1,4 +1,4 @@
-.PHONY: help setup install uninstall test lint fmt check refresh clean
+.PHONY: help setup install uninstall test lint fmt check clean
 
 
 UV ?= uv
@@ -19,15 +19,12 @@ test: ## Run test suite
 	$(UV) run pytest -q
 
 lint: ## Run ruff checks
-	$(UV) run ruff check src tests scripts
+	$(UV) run ruff check src tests
 
 fmt: ## Ruff autofix
-	$(UV) run ruff check --fix src tests scripts
+	$(UV) run ruff check --fix src tests
 
 check: lint test ## Everything a change must pass
-
-refresh: ## Harvest HAR: registry.new.py proposal + upsert account (like `x2llm import`)
-	$(UV) run python scripts/har_to_endpoints.py '$(HAR)'
 
 clean: ## Remove caches
 	rm -rf .pytest_cache .ruff_cache __pycache__ src/x2llm/__pycache__

@@ -152,15 +152,16 @@ def import_account(har_file: tuple[str, ...], username: str | None) -> None:
     from . import harvest
 
     try:
-        _, txids, material = harvest.harvest(list(har_file))
+        graphql_entries, txids, material = harvest.harvest(list(har_file))
         if not material.get("auth_token"):
             raise store.StoreError("no session cookies in these HAR files (auth_token/ct0)")
         txids = harvest.backfill_txids(txids, material.get("newest_tx", ""))
         name = harvest.store_capture(material, txids, username)
+        wire_updated = store.upsert_wire(graphql_entries)
     except store.StoreError as e:
         out({"error": str(e)})
         raise SystemExit(1) from None
-    out({"imported": name, "txids": len(txids)})
+    out({"imported": name, "txids": len(txids), "wire_updated": wire_updated})
 
 
 

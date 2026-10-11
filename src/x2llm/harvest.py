@@ -1,8 +1,7 @@
 """Harvest session material from browser HAR captures.
 
-Shared by the CLI (`x2llm import`) and scripts/har_to_endpoints.py (which
-additionally proposes registry updates). One account per run: material from
-the first session found in the entries wins.
+Powers `x2llm import`. One account per run: material from the first
+session found in the entries wins.
 
 The account is identified offline from the capture itself: the `twid`
 session cookie carries the viewer's numeric user id, and any user object in
@@ -126,6 +125,7 @@ def harvest(paths: list[str]) -> tuple[dict, dict[str, str], dict]:
             if not material.get("bearer"):
                 material["bearer"] = headers.get("authorization", "")
     material["newest_tx"] = newest_tx
+    material["txid_time"] = newest_seen
     return graphql, txids, material
 
 
@@ -202,5 +202,6 @@ def store_capture(material: dict[str, str], txids: dict[str, str], user: str | N
         cookie=material.get("cookie", ""),
         user_agent=material.get("user_agent", ""),
         txids=txids,
+        txids_updated=material.get("txid_time", ""),
     )
     return store.canonical(screen_name)

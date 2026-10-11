@@ -132,9 +132,7 @@ make install       # uv tool install — puts `x2llm` on your PATH
 │   ├── cores.py         # 8 async service cores, shared by CLI and MCP
 │   ├── cli.py           # click commands, one JSON doc per command
 │   └── mcp.py           # stdio MCP server wrapping the same cores
-├── scripts/
-│   └── har_to_endpoints.py   # harvest a HAR: proposes registry.new.py + upserts the account db
-├── tests/test_x2llm.py       # offline: MockTransport, FakeClient, CliRunner, stdio roundtrip
+├── tests/test_x2llm.py  # offline: MockTransport, FakeClient, CliRunner, stdio roundtrip
 └── Makefile
 ```
 
@@ -179,7 +177,8 @@ hint instead of being retried — the right answer is to slow down.
 ### Design invariants
 
 - **RPC is encapsulated.** Only `client.py` imports httpx or knows what a
-  header is. Only `registry.py` holds wire constants - plain tracked source.
+  header is. Wire data comes from `registry.py` defaults, overridden per
+  operation by the account db's wire table (written by `x2llm import`).
 - **Cores are transport-agnostic.** They call `graphql(key, variables)` /
   `graphql_mutation(key, variables)` / `rest(path, params)` — anything with
   those three async methods works (see `FakeClient` in the tests). This is
@@ -285,25 +284,21 @@ printf '%s\n%s\n%s\n' \
 
 ## Refreshing captured tokens
 
-The package ships only **public, account-independent constants**
-(`src/x2llm/registry.py`: query ids, features blobs, fieldToggles — identical
-for every user, taken from x.com's JS bundles; they rotate on a months
-scale). Everything account-scoped — auth_token, ct0, bearer, cookie,
-user-agent and the transaction-id pool — lives in the local account db.
-**Transaction ids expire fast (observed: tens of minutes to hours)** and
-only some endpoints enforce them — `search` is the one that hurts. Nothing
-user-specific ever enters the package, so it is safe to publish. No file
-inside the repo is machine-written: refresh produces `registry.new.py`
-(gitignored) plus a diff for you to review and move over by hand.
+Everything that ages lives in the local account db — nothing in the repo
+is machine-written, and no maintenance release is ever needed for wire
+changes:
 
-Refreshes are **incremental**: entries in the HARs you pass win; operations
-they don't contain keep their previous query ids from the existing
-registry. One small HAR that only captured a search is enough — the run
-fails only if the merged result is still incomplete. The generator prints
-which endpoints were refreshed vs kept, then updates the account db.
+- **account rows** — auth_token, ct0, bearer, cookie, user-agent and the
+  transaction-id pool. Transaction ids expire fast (observed: tens of
+  minutes to hours); only some endpoints enforce them — `search` is the
+  one that hurts (the `txgen` minting covers most of the gap).
+- **wire rows** — per-operation query ids, features blobs and
+  fieldToggles harvested from the capture. They override the shipped
+  defaults in `registry.py` per operation, so x.com bundle rotations are
+  absorbed by the next import.
 
-When `search` or `like` starts failing with an empty 404 (the error text
-says so), or credentials go stale:
+When `search` or `like` starts failing with an empty 404, or credentials
+go stale:
 
 1. Open x.com logged in as the account to refresh → `F12` → Network →
    filter `i/api`
@@ -312,31 +307,22 @@ says so), or credentials go stale:
    **user profile**, **like** one tweet, **scroll both home tabs** (FOR YOU
    and FOLLOWING) two screens (that touches all operations)
 3. Export HAR: Network ⚙️ gear → *Save all as HAR*
-4. Harvest:
+4. Import:
 
 ```bash
-make refresh HAR='../x.com_Archive [26-10-07 13-27-31].har'
-# prints a unified diff; then, if it looks right:
-mv registry.new.py src/x2llm/registry.py && make check
-# the account db was already updated in place - nothing to copy
+x2llm import '../x.com_Archive [26-10-10 09-19-00].har'
+# -> {"imported": "xer0c", "txids": 10, "wire_updated": ["home", "search", ...]}
 ```
 
-The account half behaves exactly like `x2llm import`: identity comes from
-the capture's `twid` cookie (user objects in the responses), `--user NAME`
-files explicitly and is verified against the capture's session id — no way
-to file credentials under the wrong user. One account per run: capture
-each browser profile separately.
+Identity comes from the capture's `twid` cookie (user objects in the
+responses); `--user NAME` files explicitly and is verified against the
+capture's session id — no way to file credentials under the wrong user.
+One account per run: capture each browser profile separately. Several HAR
+files merge in one run: `x2llm import reads.har like.har`.
 
 While `search`/`like` are down, everything else keeps working — tweet,
 notifications, analytics, following, suggest, both home tabs and user lookups
 work without any transaction id at all.
-Features blobs and fieldToggles are captured per endpoint (x.com ships
-several variants). The generator accepts several HAR files and merges them,
-so captures can be split across sessions:
-
-```bash
-uv run python scripts/har_to_endpoints.py 'reads.har' 'like.har'
-```
 
 ## Testing
 
@@ -360,15 +346,15 @@ commands are unaffected.
 
 ### `{"error": "…: HTTP 401/403 …"}`
 
-The account's `auth_token`/`ct0` are stale (logged out elsewhere? password
-change? long-lived capture?). Re-capture and `make refresh` per the section
+The account's credentials are stale (logged out elsewhere? password
+change? long-lived capture?). Re-capture and `x2llm import` per the section
 above — the harvest stores the full `Cookie` header (including
 `cf_clearance`) and the capture browser's user-agent, which covers the
 IP/UA-drift cases automatically.
 
 ### `{"error": "no accounts stored yet …"}`
 
-The account db is empty — run `make refresh HAR=...` first (see
+The account db is empty — run `x2llm import capture.har` first (see
 [Getting Started](#getting-started)). With several accounts stored, pick one
 with `-u/--user` (CLI) or the `username` parameter (MCP tools).
 
