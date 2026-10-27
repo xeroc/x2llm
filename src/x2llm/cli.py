@@ -1,4 +1,5 @@
 """Click CLI. Every command prints one JSON document; errors print {"error": ...} and exit 1."""
+
 from __future__ import annotations
 
 import asyncio
@@ -48,10 +49,13 @@ def cli(username: str | None) -> None:
     """x2llm - read-only x.com (Twitter) API client for agents. JSON out."""
     click.get_current_context().obj = {"username": username}
 
+
 @cli.command()
 @click.option("--limit", type=int, default=20, show_default=True)
 @click.option("--cursor", default=None, help="Pagination cursor from a previous page.")
-@click.option("--tab", type=click.Choice(["for_you", "following"]), default="for_you", show_default=True)
+@click.option(
+    "--tab", type=click.Choice(["for_you", "following"]), default="for_you", show_default=True
+)
 def home(limit: int, cursor: str | None, tab: str) -> None:
     """Your home timeline (for_you or following); scroll with the returned cursor."""
     invoke(lambda c: cores.home(c, limit=limit, cursor=cursor, tab=tab))
@@ -86,7 +90,9 @@ def suggest(query: str) -> None:
 @cli.command()
 @click.argument("query")
 @click.option("--limit", type=int, default=20, show_default=True)
-@click.option("--product", type=click.Choice(["Top", "Latest", "Media"]), default="Top", show_default=True)
+@click.option(
+    "--product", type=click.Choice(["Top", "Latest", "Media"]), default="Top", show_default=True
+)
 @click.option("--cursor", default=None, help="Pagination cursor from a previous page.")
 def search(query: str, limit: int, product: str, cursor: str | None) -> None:
     """Full search. Supports operators: from:user, since:, lang:, min_faves: ..."""
@@ -97,7 +103,8 @@ def search(query: str, limit: int, product: str, cursor: str | None) -> None:
 @click.argument("tweet_id")
 @click.option("--cursor", default=None, help="Pagination cursor for more replies.")
 def tweet(tweet_id: str, cursor: str | None) -> None:
-    """One tweet plus its reply thread."""
+    """One tweet plus its reply thread. Long-form articles arrive under
+    "article" (title, summary, full body as markdown)."""
     invoke(lambda c: cores.tweet(c, tweet_id, cursor=cursor))
 
 
@@ -155,14 +162,12 @@ def import_account(har_file: tuple[str, ...], username: str | None) -> None:
         graphql_entries, txids, material = harvest.harvest(list(har_file))
         if not material.get("auth_token"):
             raise store.StoreError("no session cookies in these HAR files (auth_token/ct0)")
-        txids = harvest.backfill_txids(txids, material.get("newest_tx", ""))
         name = harvest.store_capture(material, txids, username)
         wire_updated = store.upsert_wire(graphql_entries)
     except store.StoreError as e:
         out({"error": str(e)})
         raise SystemExit(1) from None
     out({"imported": name, "txids": len(txids), "wire_updated": wire_updated})
-
 
 
 @cli.command()
@@ -184,14 +189,12 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-
 @cli.command()
 @click.argument("text")
 @click.option("--reply-to", default=None, help="Tweet id to reply to.")
 def post(text: str, reply_to: str | None) -> None:
     """Post a tweet. REAL action: public and permanent. Use with care."""
     invoke(lambda c: cores.post_tweet(c, text, reply_to=reply_to))
-
 
 
 @cli.command()

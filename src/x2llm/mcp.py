@@ -84,7 +84,7 @@ MCP_TOOLS = [
     ),
     (
         "get_tweet",
-        ("One post by id plus its reply thread; cursor paginates deeper replies."),
+        ("One post by id plus its reply thread; cursor paginates deeper replies. Long-form articles come back under article (title, summary, full body as markdown)."),
         cores.tweet,
         True,
     ),

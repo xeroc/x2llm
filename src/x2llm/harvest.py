@@ -5,12 +5,16 @@ session found in the entries wins.
 
 The account is identified offline from the capture itself: the `twid`
 session cookie carries the viewer's numeric user id, and any user object in
-x.com's response bodies with that id names the account. No network needed.
+x.com's response bodies with that id names the account. Captures that never
+name the viewer are resolved live via x.com's intent page (see
+resolve_session_name) - still verified against the session id.
 """
+
 from __future__ import annotations
 
 import asyncio
 import json
+import re
 import urllib.parse
 from pathlib import Path
 
@@ -21,6 +25,7 @@ from .client import XClient
 from .config import DEFAULT_USER_AGENT, Config
 from .registry import BEARER as REGISTRY_BEARER
 from .store import StoreError
+from .txgen import CHROME_UA
 
 READS = {
     "SearchTimeline": "search",
@@ -30,10 +35,11 @@ READS = {
     "accountOverviewDailyQuery": "analytics",
     "UserByScreenName": "user",
 }
-POST_READS = {"HomeTimeline": "home",  # FOR YOU tab
-              "HomeLatestTimeline": "home_following"}  # FOLLOWING tab
+POST_READS = {
+    "HomeTimeline": "home",  # FOR YOU tab
+    "HomeLatestTimeline": "home_following",
+}  # FOLLOWING tab
 MUTATIONS = {"FavoriteTweet": "like", "CreateTweet": "create_tweet"}
-ALL_OPS = frozenset(READS.values()) | frozenset(POST_READS.values()) | frozenset(MUTATIONS.values())
 
 
 def _find_screen_name(node, viewer_id: str) -> str | None:
@@ -60,7 +66,7 @@ def harvest(paths: list[str]) -> tuple[dict, dict[str, str], dict]:
     graphql: dict[str, dict] = {}
     txids: dict[str, str] = {}
     material: dict[str, str] = {}
-    newest_seen = newest_tx = ""
+    newest_seen = ""
     for arg in paths:
         har = json.loads(Path(arg).read_text())
         for e in har["log"]["entries"]:
@@ -68,7 +74,7 @@ def harvest(paths: list[str]) -> tuple[dict, dict[str, str], dict]:
             headers = {h["name"].lower(): h["value"] for h in req["headers"]}
             tx = headers.get("x-client-transaction-id", "")
             if tx and e["startedDateTime"] > newest_seen:
-                newest_seen, newest_tx = e["startedDateTime"], tx
+                newest_seen = e["startedDateTime"]
             if not material.get("auth_token"):
                 cookies = {}
                 for part in headers.get("cookie", "").split("; "):
@@ -124,18 +130,8 @@ def harvest(paths: list[str]) -> tuple[dict, dict[str, str], dict]:
             graphql[key] = entry
             if not material.get("bearer"):
                 material["bearer"] = headers.get("authorization", "")
-    material["newest_tx"] = newest_tx
     material["txid_time"] = newest_seen
     return graphql, txids, material
-
-
-def backfill_txids(txids: dict[str, str], newest_tx: str) -> dict[str, str]:
-    """The txid pool is shared across endpoints: fill ops without their own
-    captured id with the newest seen one (all expire together, ~1h)."""
-    for key in ALL_OPS:
-        if key not in txids and newest_tx:
-            txids[key] = newest_tx
-    return txids
 
 
 def verify_name(
@@ -182,13 +178,58 @@ def verify_name(
         return None
 
 
+SCREEN_NAME_RE = re.compile(r"^[A-Za-z0-9_]{1,15}$")
+
+
+def resolve_session_name(
+    material: dict[str, str],
+    http: httpx.Client | None = None,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> str | None:
+    """Resolve the capture's twid id to a screen name, live.
+
+    x.com's public intent page answers id -> screen name anonymously; the
+    name is then verified against the session (profile rest_id == twid id),
+    the same check --user gets. None when there is no twid, the lookup
+    fails, or verification disproves the name.
+    """
+    viewer_id = material.get("viewer_id")
+    if not viewer_id:
+        return None
+    own = http is None
+    if own:
+        http = httpx.Client(
+            headers={"user-agent": CHROME_UA, "accept-language": "en"},
+            follow_redirects=True,
+            timeout=20,
+        )
+    try:
+        page = http.get("https://x.com/intent/user", params={"user_id": viewer_id})
+        # successful lookups redirect to https://x.com/<name>?_intent=...
+        name = page.url.path.lstrip("/").split("/", 1)[0]
+        if not SCREEN_NAME_RE.match(name):
+            m = re.search(r"\(@([A-Za-z0-9_]{1,15})\)", page.text)  # title fallback
+            name = m.group(1) if m else ""
+    except httpx.HTTPError:
+        return None
+    finally:
+        if own:
+            http.close()
+    if not name or verify_name(material, name, transport=transport) is False:
+        return None
+    return name
+
+
 def store_capture(material: dict[str, str], txids: dict[str, str], user: str | None) -> str:
     """Store the capture's session material under its account. Returns screen name."""
     screen_name = user or material.get("screen_name")
     if not screen_name:
+        screen_name = resolve_session_name(material)  # live: intent page + verify
+    if not screen_name:
         raise StoreError(
             "could not identify the account from this capture (no user object "
-            "matching the session's twid cookie) - rerun with --user NAME"
+            "matching the session's twid cookie, and the live id->name lookup "
+            "failed) - rerun with --user NAME"
         )
     if user and verify_name(material, user) is False:
         raise StoreError(

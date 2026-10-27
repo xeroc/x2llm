@@ -2,6 +2,7 @@
 cores (FakeClient), CLI (CliRunner), HAR generator and one stdio MCP
 roundtrip. No test touches the network or the real account db.
 """
+
 from __future__ import annotations
 
 import inspect
@@ -43,6 +44,7 @@ def _seed(db, name="fabian", **kw):
         txids=kw.get("txids", {"search": "STX"}),
         txids_updated=kw.get("txids_updated", datetime.now(UTC).isoformat(timespec="seconds")),
     )
+
 
 def test_store_roundtrip_and_case_folding(db):
     _seed(db, "Fabian")
@@ -144,7 +146,6 @@ def test_list_accounts_marks_default(db):
     assert rows["a"]["default"] is True and rows["b"]["default"] is False
 
 
-
 def test_wire_roundtrip_and_override(db):
     db.upsert_wire({"search": {"query_id": "NEW", "name": "SearchTimeline", "method": "get"}})
     wire = db.get_wire()
@@ -210,8 +211,6 @@ def test_config_unknown_account_lists_stored(db):
 def test_config_drops_stale_txid_pool(db):
     import sqlite3
 
-
-
     now = datetime.now(UTC).isoformat(timespec="seconds")
     _seed(db, txids={"search": "STX"}, txids_updated=now)
     assert Config.load("fabian").txids == {"search": "STX"}  # fresh capture keeps them
@@ -271,6 +270,7 @@ def test_client_403_hints_at_credentials():
     )
     with pytest.raises(XApiError, match="credentials rejected"):
         _run(client.rest("/1.1/search/typeahead.json", {"q": "x"}))
+
 
 def test_client_mutation_posts_json_body_with_txid(db):
     seen = {}
@@ -336,16 +336,75 @@ def tweet_payload(tid="1", text="hi", screen_name="a", **legacy):
     }
 
 
+def test_tweet_row_renders_article_body():
+    wrapper = tweet_payload(tid="6")
+    wrapper["tweet_results"]["result"]["article"] = {
+        "article_results": {
+            "result": {
+                "rest_id": "2105746476039127040",
+                "title": "It's ORE's Time",
+                "summary_text": "- one\n- two",
+                "metadata": {"first_published_at_secs": 0},
+                "lifecycle_state": {"modified_at_secs": 60},
+                "cover_media": {"media_info": {"original_img_url": "https://pbs/cover.jpg"}},
+                "media_entities": [
+                    {"media_id": "14", "media_info": {"original_img_url": "https://pbs/a.jpg"}}
+                ],
+                "content_state": {
+                    "blocks": [
+                        {"type": "header-one", "text": "H1"},
+                        {"type": "unstyled", "text": "Body."},
+                        {
+                            "type": "atomic",
+                            "text": " ",
+                            "entityRanges": [{"key": 0, "offset": 0, "length": 1}],
+                        },
+                        {
+                            "type": "atomic",
+                            "text": " ",
+                            "entityRanges": [{"key": 1, "offset": 0, "length": 1}],
+                        },
+                    ],
+                    "entityMap": [
+                        {
+                            "key": "8",
+                            "value": {
+                                "type": "MEDIA",
+                                "data": {"mediaItems": [{"mediaId": "14"}]},
+                            },
+                        },
+                        {"key": "9", "value": {"type": "DIVIDER", "data": {}}},
+                    ],
+                },
+            }
+        }
+    }
+    art = parse.collect_tweets(wrapper)[0]["article"]
+    assert art["id"] == "2105746476039127040"
+    assert art["title"] == "It's ORE's Time"
+    assert art["published_at"] == "1970-01-01T00:00:00+00:00"
+    assert art["cover_url"] == "https://pbs/cover.jpg"
+    assert art["text"] == (
+        "# H1\n\nBody.\n\n![image](https://pbs/a.jpg)\n\n---"
+    )
+
+
+def test_tweet_row_has_no_article_key_for_plain_tweets():
+    assert "article" not in parse.collect_tweets(tweet_payload())[0]
+
 def test_tweet_row_prefers_note_tweet_text():
     payload = tweet_payload()
     payload["tweet_results"]["result"]["note_tweet"] = {
-        "note_tweet_results": {"result": {"text": "the full long text"}}}
+        "note_tweet_results": {"result": {"text": "the full long text"}}
+    }
     assert parse.collect_tweets(payload)[0]["text"] == "the full long text"
 
 
 def test_collect_tweets_unwraps_visibility_and_dedups():
     inner = tweet_payload(tid="7")["tweet_results"]["result"]
-    wrapped = {"tweet_results": {"result": {"__typename": "TweetWithVisibilityResults", "tweet": inner}}}
+    wrapped = {
+        "tweet_results": {"result": {"__typename": "TweetWithVisibilityResults", "tweet": inner}}
+    }
     doc = {"a": wrapped, "b": tweet_payload(tid="7"), "c": tweet_payload(tid="8")}
     rows = parse.collect_tweets(doc)
     assert [r["id"] for r in rows] == ["7", "8"]
@@ -355,11 +414,18 @@ def test_collect_tweets_unwraps_visibility_and_dedups():
 def test_collect_cursors():
     doc = {
         "entries": [
-            {"content": {"entryType": "TimelineTimelineCursor", "cursorType": "Bottom", "value": "B"}},
+            {
+                "content": {
+                    "entryType": "TimelineTimelineCursor",
+                    "cursorType": "Bottom",
+                    "value": "B",
+                }
+            },
             {"content": {"entryType": "TimelineTimelineCursor", "cursorType": "Top", "value": "T"}},
         ]
     }
     assert parse.collect_cursors(doc) == {"top": "T", "bottom": "B"}
+
 
 def test_notification_rows_dedup_and_shape():
     item = {
@@ -390,7 +456,9 @@ class FakeClient:
         return self.response
 
     async def graphql_post(self, key, variables):
-        self.calls.append(("mutation" if key in ("like", "create_tweet") else "post", key, variables))
+        self.calls.append(
+            ("mutation" if key in ("like", "create_tweet") else "post", key, variables)
+        )
         return self.response
 
     async def rest(self, path, params):
@@ -402,8 +470,13 @@ def test_search_core_truncates_and_returns_cursor():
     response = {
         "data": {
             "list": [tweet_payload(tid=str(i)) for i in range(5)],
-            "cursor": {"content": {
-                "entryType": "TimelineTimelineCursor", "cursorType": "Bottom", "value": "C"}},
+            "cursor": {
+                "content": {
+                    "entryType": "TimelineTimelineCursor",
+                    "cursorType": "Bottom",
+                    "value": "C",
+                }
+            },
         }
     }
     fake = FakeClient(response)
@@ -443,7 +516,9 @@ def test_analytics_core_aggregates_series_and_decodes_viewer():
 
 
 def test_following_core_numeric_vs_name_and_cursor_end():
-    fake = FakeClient({"users": [{"id_str": "2", "screen_name": "b", "name": "B"}], "next_cursor": 0})
+    fake = FakeClient(
+        {"users": [{"id_str": "2", "screen_name": "b", "name": "B"}], "next_cursor": 0}
+    )
     result = _run(cores.following(fake, "123", limit=1))
     assert fake.calls[0][2]["user_id"] == "123"
     assert result["cursor"] is None
@@ -452,27 +527,49 @@ def test_following_core_numeric_vs_name_and_cursor_end():
 
 
 def test_suggest_core_shape():
-    fake = FakeClient({"topics": [{"topic": "bitcoin"}], "users": [{"id_str": "1", "screen_name": "a", "name": "A"}]})
+    fake = FakeClient(
+        {
+            "topics": [{"topic": "bitcoin"}],
+            "users": [{"id_str": "1", "screen_name": "a", "name": "A"}],
+        }
+    )
     assert _run(cores.suggest(fake, "bit")) == {
-        "topics": ["bitcoin"], "users": [{"id": "1", "screen_name": "a", "name": "A"}]
+        "topics": ["bitcoin"],
+        "users": [{"id": "1", "screen_name": "a", "name": "A"}],
     }
 
+
 def test_user_core_maps_profile_and_strips_at():
-    response = {"data": {"user": {"result": {
-        "rest_id": "7", "is_blue_verified": True,
-        "core": {"screen_name": "a", "name": "A", "created_at": "Fri Sep 25 12:59:34 +0000 2026"},
-        "profile_bio": {"description": "builder", "entities": {"url": {"urls": [
-            {"expanded_url": "https://example.com"}]}}},
-        "location": {"location": "Berlin"},
-        "relationship_counts": {"followers": 10, "following": 5},
-        "tweet_counts": {"tweets": 100, "media_tweets": 4},
-    }}}}
+    response = {
+        "data": {
+            "user": {
+                "result": {
+                    "rest_id": "7",
+                    "is_blue_verified": True,
+                    "core": {
+                        "screen_name": "a",
+                        "name": "A",
+                        "created_at": "Fri Sep 25 12:59:34 +0000 2026",
+                    },
+                    "profile_bio": {
+                        "description": "builder",
+                        "entities": {"url": {"urls": [{"expanded_url": "https://example.com"}]}},
+                    },
+                    "location": {"location": "Berlin"},
+                    "relationship_counts": {"followers": 10, "following": 5},
+                    "tweet_counts": {"tweets": 100, "media_tweets": 4},
+                }
+            }
+        }
+    }
     fake = FakeClient(response)
     row = _run(cores.user(fake, "@a"))
     kind, key, variables = fake.calls[0]
     assert (kind, key) == ("graphql", "user")
     assert variables == {"screen_name": "a", "withGrokTranslatedBio": True}
-    assert row["screen_name"] == "a" and row["followers"] == 10 and row["url"] == "https://example.com"
+    assert (
+        row["screen_name"] == "a" and row["followers"] == 10 and row["url"] == "https://example.com"
+    )
 
 
 def test_user_core_not_found_raises():
@@ -483,6 +580,7 @@ def test_user_core_not_found_raises():
 
 def test_rate_limiter_spaces_requests():
     import time as time_mod
+
     cfg = mkconfig(rate_per_min=600)
     client = XClient(cfg, transport=httpx.MockTransport(lambda r: httpx.Response(200, json={})))
     start = time_mod.monotonic()
@@ -493,6 +591,7 @@ def test_rate_limiter_spaces_requests():
 
 def test_rate_limiter_disabled_passes_through():
     import time as time_mod
+
     cfg = mkconfig(rate_per_min=0)
     client = XClient(cfg, transport=httpx.MockTransport(lambda r: httpx.Response(200, json={})))
     start = time_mod.monotonic()
@@ -511,27 +610,41 @@ def test_like_core_uses_mutation_primitive():
 
 
 def test_home_core_builds_variables_and_pages():
-    response = {"data": {"home": {"list": [tweet_payload(tid=str(i)) for i in range(5)],
-                                  "c": {"entryType": "TimelineTimelineCursor",
-                                        "cursorType": "Bottom", "value": "NX"}}}}
+    response = {
+        "data": {
+            "home": {
+                "list": [tweet_payload(tid=str(i)) for i in range(5)],
+                "c": {"entryType": "TimelineTimelineCursor", "cursorType": "Bottom", "value": "NX"},
+            }
+        }
+    }
     fake = FakeClient(response)
     result = _run(cores.home(fake, limit=2))
     kind, key, variables = fake.calls[0]
     assert (kind, key) == ("post", "home")
-    assert variables == {"count": 2, "includePromotedContent": True,
-                         "withCommunity": True, "requestContext": "ptr"}
+    assert variables == {
+        "count": 2,
+        "includePromotedContent": True,
+        "withCommunity": True,
+        "requestContext": "ptr",
+    }
     assert [t["id"] for t in result["tweets"]] == ["0", "1"]
     assert result["cursor"] == "NX"
     _run(cores.home(fake, limit=2, cursor="NX"))
     assert fake.calls[1][2]["cursor"] == "NX"
     _run(cores.home(fake, limit=2, tab="following"))
     assert fake.calls[2][1] == "home_following"
-    assert fake.calls[2][2] == {"count": 2, "enableRanking": True,
-                                "includePromotedContent": True}
+    assert fake.calls[2][2] == {"count": 2, "enableRanking": True, "includePromotedContent": True}
+
 
 def test_post_tweet_core_shapes():
-    response = {"data": {"create_tweet": {"tweet_results": {"result": {
-        "rest_id": "99", "legacy": {"full_text": "hi"}}}}}}
+    response = {
+        "data": {
+            "create_tweet": {
+                "tweet_results": {"result": {"rest_id": "99", "legacy": {"full_text": "hi"}}}
+            }
+        }
+    }
     fake = FakeClient(response)
     result = _run(cores.post_tweet(fake, "hi"))
     kind, key, variables = fake.calls[0]
@@ -588,7 +701,9 @@ def test_cli_no_account_is_error(db):
 
 def test_cli_user_flag_selects_account(monkeypatch, db):
     seen_configs = []
-    monkeypatch.setattr(cli, "XClient", lambda cfg: (seen_configs.append(cfg), FakeGraphClient())[1])
+    monkeypatch.setattr(
+        cli, "XClient", lambda cfg: (seen_configs.append(cfg), FakeGraphClient())[1]
+    )
     _seed(db, "fabian")
     _seed(db, "other")
     result = CliRunner().invoke(cli.cli, ["-u", "OTHER", "search", "x"])
@@ -598,7 +713,9 @@ def test_cli_user_flag_selects_account(monkeypatch, db):
 
 def test_cli_multiple_accounts_use_default(monkeypatch, db):
     seen_configs = []
-    monkeypatch.setattr(cli, "XClient", lambda cfg: (seen_configs.append(cfg), FakeGraphClient())[1])
+    monkeypatch.setattr(
+        cli, "XClient", lambda cfg: (seen_configs.append(cfg), FakeGraphClient())[1]
+    )
     _seed(db, "fabian")
     _seed(db, "other")
     result = CliRunner().invoke(cli.cli, ["search", "x"])
@@ -606,14 +723,18 @@ def test_cli_multiple_accounts_use_default(monkeypatch, db):
     assert seen_configs[0].screen_name == "fabian"  # first import = default
 
 
-
-
 def test_cli_prime_dumps_agent_briefing():
     result = CliRunner().invoke(cli.cli, ["prime"])
     assert result.exit_code == 0
     doc = result.output
-    for section in ("agent briefing", "## Commands", "## Examples", "## REAL actions",
-                    "Error dictionary", "MCP server"):
+    for section in (
+        "agent briefing",
+        "## Commands",
+        "## Examples",
+        "## REAL actions",
+        "Error dictionary",
+        "MCP server",
+    ):
         assert section in doc
     # doc-rot guard: every `x2llm <cmd>` referenced in the doc must exist
     import re
@@ -623,17 +744,25 @@ def test_cli_prime_dumps_agent_briefing():
     for _, cmd in referenced:
         assert cmd in cmds, f"prime references unknown command: {cmd}"
 
+
 def _mini_har(op, qid, txid, method="GET"):
     url = f"https://x.com/i/api/graphql/{qid}/{op}?variables=%7B%7D&features=%7B%7D"
-    entry = {"startedDateTime": "2026-10-07T13:00:00",
-             "request": {"method": method, "url": url, "headers": [
-        {"name": "x-client-transaction-id", "value": txid},
-        {"name": "authorization", "value": "Bearer x"},
-        {"name": "cookie", "value": "auth_token=a; ct0=c"},
-    ]}}
+    entry = {
+        "startedDateTime": "2026-10-07T13:00:00",
+        "request": {
+            "method": method,
+            "url": url,
+            "headers": [
+                {"name": "x-client-transaction-id", "value": txid},
+                {"name": "authorization", "value": "Bearer x"},
+                {"name": "cookie", "value": "auth_token=a; ct0=c"},
+            ],
+        },
+    }
     if method == "POST":
         entry["request"]["postData"] = {
-            "text": json.dumps({"variables": {}, "queryId": qid, "features": {}})}
+            "text": json.dumps({"variables": {}, "queryId": qid, "features": {}})
+        }
     return {"log": {"entries": [entry]}}
 
 
@@ -644,15 +773,30 @@ def test_cli_import_identifies_and_stores(db, tmp_path, monkeypatch):
     har.write_text(json.dumps(_mini_har("SearchTimeline", "Q", "TX")))
     identified = {**MATERIAL, "screen_name": "Xeroc"}
     wire = {"search": {"query_id": "Q", "name": "SearchTimeline", "method": "get"}}
-    monkeypatch.setattr(
-        harvest, "harvest", lambda paths: (wire, {"search": "T"}, identified)
-    )
+    monkeypatch.setattr(harvest, "harvest", lambda paths: (wire, {"search": "T"}, identified))
     result = CliRunner().invoke(cli.cli, ["import", str(har)])
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     assert payload["imported"] == "xeroc" and payload["txids"] >= 1
     assert payload["wire_updated"] == ["search"]
     assert db.get_wire()["search"]["query_id"] == "Q"
+
+
+def test_cli_import_stores_only_own_op_txids(db, tmp_path, monkeypatch):
+    """txids are path-bound server-side (search rejects a home-path id with an
+    empty 404): a capture that only exercised one op must not seed foreign
+    ids into the other ops - those mint fresh path-correct ones instead."""
+    from x2llm import harvest
+
+    har = tmp_path / "cap.har"
+    har.write_text(json.dumps(_mini_har("ViewerBadgeCounts", "Q", "BTX")))
+    identified = {**MATERIAL, "screen_name": "Xeroc", "newest_tx": "FOREIGN"}
+    wire = {"badges": {"query_id": "Q", "name": "ViewerBadgeCounts", "method": "get"}}
+    monkeypatch.setattr(harvest, "harvest", lambda paths: (wire, {"badges": "BTX"}, identified))
+    result = CliRunner().invoke(cli.cli, ["import", str(har)])
+    assert result.exit_code == 0, result.output
+    row = db.get_account("xeroc")
+    assert row["txids"] == {"badges": "BTX"}
 
 
 def test_cli_accounts_default_show_and_set(db):
@@ -687,8 +831,8 @@ def test_cli_accounts_list_and_remove(db):
     assert result.exit_code == 1
     assert "no such account" in json.loads(result.output[result.output.index("{") :])["error"]
 
-# --- MCP stdio roundtrip ------------------------------------------------------------
 
+# --- MCP stdio roundtrip ------------------------------------------------------------
 
 
 def test_cli_import_user_flag_overrides(db, tmp_path):
@@ -701,15 +845,26 @@ def test_cli_import_user_flag_overrides(db, tmp_path):
 
 def test_cli_import_without_cookies_is_error(db, tmp_path):
     har = tmp_path / "dry.har"
-    entry = {"log": {"entries": [{"startedDateTime": "t", "request": {
-        "method": "GET", "url": "https://x.com/home", "headers": []}}]}}
+    entry = {
+        "log": {
+            "entries": [
+                {
+                    "startedDateTime": "t",
+                    "request": {"method": "GET", "url": "https://x.com/home", "headers": []},
+                }
+            ]
+        }
+    }
     har.write_text(json.dumps(entry))
     result = CliRunner().invoke(cli.cli, ["import", str(har)])
     assert result.exit_code == 1
     assert "no session" in json.loads(result.output)["error"]
 
 
-def test_cli_import_unidentifiable_is_error(db, tmp_path):
+def test_cli_import_unidentifiable_is_error(db, tmp_path, monkeypatch):
+    from x2llm import harvest
+
+    monkeypatch.setattr(harvest, "resolve_session_name", lambda *a, **k: None)
     har = tmp_path / "cap.har"
     har.write_text(json.dumps(_mini_har("SearchTimeline", "Q", "TX")))  # no twid/user object
     result = CliRunner().invoke(cli.cli, ["import", str(har)])
@@ -729,9 +884,16 @@ def test_mcp_server_stdio_roundtrip():
         cwd=Path(__file__).resolve().parents[1],
     )
     reqs = [
-        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
-            "protocolVersion": "2025-06-18", "capabilities": {},
-            "clientInfo": {"name": "t", "version": "0"}}},
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "t", "version": "0"},
+            },
+        },
         {"jsonrpc": "2.0", "method": "notifications/initialized"},
         {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
     ]
@@ -759,7 +921,9 @@ def test_bind_tool_routes_username_to_client(monkeypatch, db):
 
     class BadgesClient:
         async def graphql(self, key, variables):
-            return {"data": {"viewer_v2": {"user_results": {"result": {"badge_counts": {"dm": 1}}}}}}
+            return {
+                "data": {"viewer_v2": {"user_results": {"result": {"badge_counts": {"dm": 1}}}}}
+            }
 
     async def fake_client(username=None):
         seen["username"] = username
@@ -771,6 +935,7 @@ def test_bind_tool_routes_username_to_client(monkeypatch, db):
     result = _run(bound(username="fabian"))
     assert seen["username"] == "fabian"
     assert result == {"badges": {"dm": 1}}
+
 
 # --- helper ---------------------------------------------------------------------
 
@@ -802,14 +967,23 @@ def test_harvest_identifies_viewer_via_twid(tmp_path):
     body = json.dumps(
         {"data": {"users": [{"rest_id": "15904453", "core": {"screen_name": "Xeroc"}}]}}
     )
-    har = {"log": {"entries": [{
-        "startedDateTime": "2026-10-10T09:00:00",
-        "request": {"method": "GET",
-                    "url": "https://x.com/i/api/graphql/X/ViewerBadgeCounts?variables=%7B%7D",
-                    "headers": [{"name": "cookie",
-                                 "value": "auth_token=a; ct0=c; twid=u%3D15904453"}]},
-        "response": {"content": {"text": body}},
-    }]}}
+    har = {
+        "log": {
+            "entries": [
+                {
+                    "startedDateTime": "2026-10-10T09:00:00",
+                    "request": {
+                        "method": "GET",
+                        "url": "https://x.com/i/api/graphql/X/ViewerBadgeCounts?variables=%7B%7D",
+                        "headers": [
+                            {"name": "cookie", "value": "auth_token=a; ct0=c; twid=u%3D15904453"}
+                        ],
+                    },
+                    "response": {"content": {"text": body}},
+                }
+            ]
+        }
+    }
     p = tmp_path / "id.har"
     p.write_text(json.dumps(har))
     _, _, material = h.harvest([str(p)])
@@ -835,10 +1009,11 @@ def test_store_capture_user_flag_wins(db):
     assert db.get_account("offline")["auth_token"] == "at"
 
 
-def test_store_capture_unidentifiable_raises(db):
+def test_store_capture_unidentifiable_raises(db, monkeypatch):
     from x2llm import harvest
     from x2llm.store import StoreError
 
+    monkeypatch.setattr(harvest, "resolve_session_name", lambda m: None)
     with pytest.raises(StoreError, match="--user"):
         harvest.store_capture(MATERIAL, {}, None)
 
@@ -871,3 +1046,44 @@ def test_store_capture_refuses_name_mismatch(db, monkeypatch):
     monkeypatch.setattr(harvest, "verify_name", lambda m, n: False)
     with pytest.raises(StoreError, match="mismatch"):
         harvest.store_capture(material, {}, "xer0c")
+
+
+def _intent_transport() -> httpx.MockTransport:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "intent/user" in str(request.url):
+            return httpx.Response(302, headers={"location": "https://x.com/xer0c?_intent=%7B%7D"})
+        return httpx.Response(200, text="<html></html>")
+
+    return httpx.MockTransport(handler)
+
+
+def test_resolve_session_name_via_intent_page():
+    from x2llm.harvest import resolve_session_name
+
+    material = {**MATERIAL, "viewer_id": "15904453"}
+    http = httpx.Client(transport=_intent_transport(), follow_redirects=True)
+    name = resolve_session_name(material, http=http, transport=_profile_transport("15904453"))
+    assert name == "xer0c"
+
+
+def test_resolve_session_name_without_twid_is_none():
+    from x2llm.harvest import resolve_session_name
+
+    http = httpx.Client(transport=_intent_transport(), follow_redirects=True)
+    assert resolve_session_name(MATERIAL, http=http) is None
+
+
+def test_resolve_session_name_unverified_is_none():
+    from x2llm.harvest import resolve_session_name
+
+    material = {**MATERIAL, "viewer_id": "15904453"}
+    http = httpx.Client(transport=_intent_transport(), follow_redirects=True)
+    assert resolve_session_name(material, http=http, transport=_profile_transport("42")) is None
+
+
+def test_store_capture_resolves_live_when_capture_is_silent(db, monkeypatch):
+    from x2llm import harvest
+
+    monkeypatch.setattr(harvest, "resolve_session_name", lambda m: "xer0c")
+    assert harvest.store_capture(MATERIAL, {}, None) == "xer0c"
+    assert db.get_account("xer0c")["auth_token"] == "at"

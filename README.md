@@ -13,6 +13,7 @@ following, or DMing.
 - Search (full operator support: `from:user`, `since:`, `lang:`, `min_faves:` ...)
 - Multiple accounts in a local store: `--user` on the CLI, `username` on MCP tools
 - Tweet + reply-thread retrieval
+- Full article reading: `x2llm tweet <id>` on an article returns title, summary, cover and the whole body rendered as markdown (headers, images, dividers) under `article`
 - Notification tab reading
 - Account analytics (impressions, likes, follows — your own statistics page)
 - Follower/following graphs, typeahead suggestions, unread badge counts
@@ -75,15 +76,7 @@ first write). Accounts get in via a HAR capture:
 uv run x2llm import '../x.com_Archive [26-10-10 09-19-00].har'
 ```
 
-The account is identified from the capture itself: its `twid` session
-cookie carries your numeric user id, matched against user objects in the
-responses — no live call needed. Captures that never name the viewer are
-filed explicitly instead, and that name is then **verified** live against
-the capture's session id before anything is stored:
-
-```bash
-uv run x2llm import capture.har --user xer0c   # verified: name ↔ twid id
-```
+The account is identified from the capture itself: its `twid` session cookie carries your numeric user id, matched against user objects in the responses — no live call needed. Captures that never name the viewer fall back to a live lookup: x.com's public intent page resolves the `twid` id to a screen name, and that name is **verified** live (profile rest_id ↔ twid id) before anything is stored. `--user NAME` skips straight to explicit filing under that name, with the same live verification — no way to file credentials under the wrong user.
 
 Imported material per account: auth_token, ct0, bearer, full cookie
 header, user-agent and the transaction-id pool. One account per run.
@@ -289,9 +282,10 @@ is machine-written, and no maintenance release is ever needed for wire
 changes:
 
 - **account rows** — auth_token, ct0, bearer, cookie, user-agent and the
-  transaction-id pool. Transaction ids expire fast (observed: tens of
-  minutes to hours); only some endpoints enforce them — `search` is the
-  one that hurts (the `txgen` minting covers most of the gap).
+  transaction-id pool. Transaction ids are **path-bound** (a search request
+  rejects a home-path id with an empty 404) and expire after tens of
+  minutes; imports store only ids captured on their own operation, and the
+  `txgen` module mints fresh path-correct ones for everything else.
 - **wire rows** — per-operation query ids, features blobs and
   fieldToggles harvested from the capture. They override the shipped
   defaults in `registry.py` per operation, so x.com bundle rotations are
@@ -314,15 +308,14 @@ x2llm import '../x.com_Archive [26-10-10 09-19-00].har'
 # -> {"imported": "xer0c", "txids": 10, "wire_updated": ["home", "search", ...]}
 ```
 
-Identity comes from the capture's `twid` cookie (user objects in the
-responses); `--user NAME` files explicitly and is verified against the
-capture's session id — no way to file credentials under the wrong user.
+Identity comes from the capture's `twid` cookie (user objects in the responses); captures that never name the viewer are resolved live via x.com's intent page (twid id → screen name, verified against the session), and `--user NAME` files explicitly with the same verification.
 One account per run: capture each browser profile separately. Several HAR
 files merge in one run: `x2llm import reads.har like.har`.
 
-While `search`/`like` are down, everything else keeps working — tweet,
-notifications, analytics, following, suggest, both home tabs and user lookups
-work without any transaction id at all.
+Ops without a captured id mint one via `txgen` (path-correct, always fresh),
+so a capture that never ran a search still searches. `search`/`like` only
+degrade if `txgen` itself breaks (x.com bundle change) — then a capture
+covering all operations (below) restores them.
 
 ## Testing
 
