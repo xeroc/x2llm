@@ -1,10 +1,12 @@
-"""SQLite account store: per-account session credentials, machine-local.
+"""Account store: sqlite by default, postgres via DATABASE_URL.
 
 One row per x.com account, keyed by lowercased screen name, plus a tiny
-meta table. The db lives in platformdirs user_data_dir ("x2llm") with
-0700/0600 permissions - it holds live session secrets (auth_token IS the
-account). Infra knobs that are not credentials (X_API_BASE, X_TIMEOUT,
-X_RATE_LIMIT) stay in the environment.
+meta table. Default backend is a sqlite db in platformdirs user_data_dir
+("x2llm") with 0700/0600 permissions - it holds live session secrets
+(auth_token IS the account). Set DATABASE_URL (any libpq conninfo/URI) to
+store in postgres instead; both backends share the exact same SQL. Infra
+knobs that are not credentials (X_API_BASE, X_TIMEOUT, X_RATE_LIMIT) stay
+in the environment.
 
 Default account: the first import becomes the default; `accounts default`
 changes it; an omitted --user/username resolves to it. Removing the
@@ -27,16 +29,12 @@ class StoreError(Exception):
     pass
 
 def db_path() -> Path:
-    """Location of the account db. Uncached so tests can monkeypatch it."""
+    """Location of the sqlite account db. Uncached so tests can monkeypatch it."""
     return Path(user_data_dir("x2llm")) / "accounts.db"
 
 
-def _connect() -> sqlite3.Connection:
-    path = db_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    os.chmod(path.parent, 0o700)
-    conn = sqlite3.connect(path)
-    conn.execute(
+_DDL = (
+    (
         "CREATE TABLE IF NOT EXISTS accounts ("
         "screen_name TEXT PRIMARY KEY,"
         "auth_token  TEXT NOT NULL,"
@@ -46,13 +44,34 @@ def _connect() -> sqlite3.Connection:
         "user_agent  TEXT NOT NULL DEFAULT '',"
         "txids       TEXT NOT NULL DEFAULT '{}',"
         "updated_at  TEXT NOT NULL)"
-    )
-    conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-    conn.execute(
+    ),
+    "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+    (
         "CREATE TABLE IF NOT EXISTS wire ("
         "operation TEXT PRIMARY KEY,"
         "entry     TEXT NOT NULL)"
-    )
+    ),
+)
+
+
+def _connect():
+    """Open the store: postgres when DATABASE_URL is set, else sqlite.
+
+    Both return a connection whose execute() speaks qmark placeholders (?)
+    and yields mapping rows (sqlite3.Row / dict), so every query in this
+    module is dialect-neutral. `with conn:` commits on success and rolls
+    back on error; the postgres facade also closes the connection.
+    """
+    url = os.environ.get("DATABASE_URL")
+    if url:
+        return _PgConn(url)
+    path = db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    for stmt in _DDL:
+        conn.execute(stmt)
     try:  # migration for dbs created before the column existed
         conn.execute("ALTER TABLE accounts ADD COLUMN txids_updated TEXT NOT NULL DEFAULT ''")
     except sqlite3.OperationalError:
@@ -60,6 +79,55 @@ def _connect() -> sqlite3.Connection:
     conn.commit()
     os.chmod(path, 0o600)
     return conn
+
+
+class _PgConn:
+    """sqlite3-style facade over psycopg: ? placeholders, dict rows.
+
+    # ponytail: fresh connection + DDL check per call; pool it if store
+    # throughput ever matters (the X API rate limiter dominates anyway).
+    """
+
+    def __init__(self, url: str):
+        try:
+            import psycopg
+            from psycopg.rows import dict_row
+        except ImportError as e:
+            raise StoreError(
+                "DATABASE_URL is set but psycopg is not installed - install "
+                "the postgres extra: pip install 'x2llm[postgres]'"
+            ) from e
+        try:
+            self._conn = psycopg.connect(url, row_factory=dict_row)
+        except Exception as e:
+            raise StoreError(f"postgres connect failed: {e}") from e
+        try:
+            with self._conn.cursor() as cur:
+                for stmt in _DDL:
+                    cur.execute(stmt)
+                cur.execute("ALTER TABLE accounts ADD COLUMN IF NOT EXISTS"
+                            " txids_updated TEXT NOT NULL DEFAULT ''")
+        except Exception as e:
+            self._conn.close()
+            raise StoreError(f"postgres schema setup failed: {e}") from e
+
+    def execute(self, sql: str, params: tuple = ()):
+        # no store SQL contains a literal '?', so blanket translation is safe
+        cur = self._conn.cursor()
+        cur.execute(sql.replace("?", "%s"), params)
+        return cur
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if exc_type is None:
+                self._conn.commit()
+            else:
+                self._conn.rollback()
+        finally:
+            self._conn.close()
 
 
 def upsert_wire(entries: dict[str, dict]) -> list[str]:
@@ -74,7 +142,7 @@ def upsert_wire(entries: dict[str, dict]) -> list[str]:
             raise StoreError(f"wire entry for '{op}' needs at least query_id and name")
         with _connect() as conn:
             row = conn.execute("SELECT entry FROM wire WHERE operation = ?", (op,)).fetchone()
-            if row is not None and json.loads(row[0]) == entry:
+            if row is not None and json.loads(row["entry"]) == entry:
                 continue
             conn.execute(
                 "INSERT INTO wire (operation, entry) VALUES (?, ?)"
@@ -87,9 +155,11 @@ def upsert_wire(entries: dict[str, dict]) -> list[str]:
 
 def get_wire() -> dict[str, dict]:
     """Harvested wire overrides (merged over registry defaults by the client)."""
+    if not os.environ.get("DATABASE_URL") and not db_path().exists():
+        return {}  # read-only sqlite lookup must not create a store
     with _connect() as conn:
         rows = conn.execute("SELECT operation, entry FROM wire").fetchall()
-    return {op: json.loads(entry) for op, entry in rows}
+    return {r["operation"]: json.loads(r["entry"]) for r in rows}
 
 
 def canonical(name: str) -> str:
@@ -98,13 +168,14 @@ def canonical(name: str) -> str:
 
 def _names() -> list[str]:
     with _connect() as conn:
-        return [r[0] for r in conn.execute("SELECT screen_name FROM accounts ORDER BY screen_name")]
+        return [r["screen_name"] for r in
+                conn.execute("SELECT screen_name FROM accounts ORDER BY screen_name")]
 
 
 def get_meta(key: str) -> str | None:
     with _connect() as conn:
         row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
-    return row[0] if row else None
+    return row["value"] if row else None
 
 
 def set_meta(key: str, value: str) -> None:
@@ -177,7 +248,6 @@ def upsert_account(
 
 def get_account(screen_name: str) -> dict | None:
     with _connect() as conn:
-        conn.row_factory = sqlite3.Row
         row = conn.execute(
             "SELECT * FROM accounts WHERE screen_name = ?", (canonical(screen_name),)
         ).fetchone()
@@ -192,7 +262,6 @@ def list_accounts() -> list[dict]:
     """Screen names + freshness + default flag - never secrets (accounts tool)."""
     default = get_default()
     with _connect() as conn:
-        conn.row_factory = sqlite3.Row
         rows = conn.execute(
             "SELECT screen_name, updated_at FROM accounts ORDER BY screen_name"
         ).fetchall()

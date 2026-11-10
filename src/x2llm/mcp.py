@@ -8,17 +8,18 @@ from __future__ import annotations
 import asyncio
 import inspect
 
-from . import cores, store
+from . import cores
 from .client import XApiError, XClient
-from .config import Config, ConfigError
+from .config import Config, ConfigError, visible_accounts
 
 MCP_INSTRUCTIONS = (
     "Access to logged-in x.com (Twitter) accounts via the private web API. "
-    "Accounts live in a local store: call the `accounts` tool to list them, "
-    "then pass `username` to any tool to pick one (omitted selects the "
-    "default account - the accounts tool marks it). Credentials expire - "
-    "refresh them with a HAR capture (see the x2llm README). "
-    "All tools are read-only except "
+    "Accounts come from a local store or from env-injected credentials "
+    "(X_AUTH_TOKEN/X_CT0): call the `accounts` tool to list what is "
+    "available, then pass `username` to any tool to pick one (omitted "
+    "selects the default account - the accounts tool marks it). "
+    "Credentials expire - refresh them with a HAR capture or new env "
+    "values (see the x2llm README). All tools are read-only except "
     "like_tweet, which performs a REAL, publicly visible action and notifies "
     "the author - never call it unless the user explicitly asked to like that "
     "specific post. search supports X operators (from:user, "
@@ -157,7 +158,7 @@ async def mcp_client(username: str | None = None) -> XClient:
 
 
 async def _list_accounts() -> dict:
-    return {"accounts": store.list_accounts()}
+    return {"accounts": visible_accounts()}
 
 
 def bind_tool(fn):
@@ -194,8 +195,9 @@ def build_mcp_server():
         _list_accounts,
         name="accounts",
         description=(
-            "List stored x.com accounts (screen name + last refresh time; "
-            "never credentials). Pass a tool's username parameter to select one."
+            "List available x.com accounts (screen name + freshness; never "
+            "credentials). Env-injected accounts are marked source=env. "
+            "Pass a tool's username parameter to select one."
         ),
         annotations=ToolAnnotations(read_only_hint=True),
     )

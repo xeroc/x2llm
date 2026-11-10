@@ -10,7 +10,7 @@ import click
 
 from . import cores, store
 from .client import XApiError, XClient
-from .config import Config, ConfigError
+from .config import Config, ConfigError, visible_accounts
 
 
 def out(obj) -> None:
@@ -211,8 +211,12 @@ def accounts() -> None:
 
 @accounts.command("list")
 def accounts_list() -> None:
-    """Show stored screen names and when each was last refreshed."""
-    out({"accounts": store.list_accounts()})
+    """Show available screen names (store or env) and when each was last refreshed."""
+    try:
+        out({"accounts": visible_accounts()})
+    except store.StoreError as e:
+        out({"error": str(e)})
+        raise SystemExit(1) from None
 
 
 @accounts.command("default")

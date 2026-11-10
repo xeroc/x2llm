@@ -5,6 +5,7 @@ roundtrip. No test touches the network or the real account db.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import os
@@ -222,6 +223,107 @@ def test_config_drops_stale_txid_pool(db):
 def test_config_empty_store_points_at_refresh(db):
     with pytest.raises(ConfigError, match="x2llm import"):
         Config.load(None)
+
+
+# --- config: env-injected credentials (storeless MCP deployments) --------------------
+
+_ENV_CREDS = {"X_AUTH_TOKEN": "at", "X_CT0": "ct", "X_ACCOUNT": "Fabian"}
+
+
+def test_config_env_injection_skips_store(monkeypatch, tmp_path):
+    from x2llm import store
+    from x2llm.registry import BEARER
+
+    monkeypatch.setattr(store, "db_path", lambda: tmp_path / "accounts.db")
+    cfg = Config.load(None, env=_ENV_CREDS)
+    assert cfg.screen_name == "fabian"  # X_ACCOUNT gets canonicalized
+    assert cfg.auth_token == "at" and cfg.ct0 == "ct"
+    assert cfg.bearer == BEARER and cfg.user_agent  # registry defaults
+    assert cfg.txids == {}  # no capture pool - txgen mints on demand
+    assert not (tmp_path / "accounts.db").exists()  # the store is never touched
+
+
+def test_config_env_requires_both_cookies(monkeypatch, tmp_path):
+    from x2llm import store
+
+    monkeypatch.setattr(store, "db_path", lambda: tmp_path / "accounts.db")
+    with pytest.raises(ConfigError, match="X_AUTH_TOKEN and X_CT0 must be set together"):
+        Config.load(None, env={"X_AUTH_TOKEN": "at"})
+    with pytest.raises(ConfigError, match="must be set together"):
+        Config.load(None, env={"X_CT0": "ct"})
+    assert not (tmp_path / "accounts.db").exists()
+
+
+def test_config_env_username_gate(monkeypatch, tmp_path):
+    from x2llm import store
+
+    monkeypatch.setattr(store, "db_path", lambda: tmp_path / "accounts.db")
+    with pytest.raises(ConfigError, match="env credentials configure"):
+        Config.load("other", env=_ENV_CREDS)
+    assert Config.load("@Fabian", env=_ENV_CREDS).screen_name == "fabian"
+
+
+def test_config_env_overrides_cookie_bearer_ua():
+    cfg = Config.load(
+        None,
+        env={
+            "X_AUTH_TOKEN": "at",
+            "X_CT0": "ct",
+            "X_COOKIE": "auth_token=at; ct0=ct; extra=1",
+            "X_BEARER": "Bearer BB",
+            "X_USER_AGENT": "UA/1",
+            "X_TIMEOUT": "5",
+        },
+    )
+    assert cfg.cookie == "auth_token=at; ct0=ct; extra=1"
+    assert cfg.bearer == "Bearer BB" and cfg.user_agent == "UA/1"
+    assert cfg.screen_name == "env" and cfg.timeout == 5.0  # X_ACCOUNT omitted
+
+
+def test_visible_accounts_env_beats_store(monkeypatch, db):
+    from x2llm.config import visible_accounts
+
+    _seed(db, "stored")
+    assert [a["screen_name"] for a in visible_accounts()] == ["stored"]
+    monkeypatch.setenv("X_AUTH_TOKEN", "at")
+    monkeypatch.setenv("X_CT0", "ct")
+    monkeypatch.setenv("X_ACCOUNT", "fabian")
+    assert visible_accounts() == [
+        {"screen_name": "fabian", "updated_at": None, "default": True, "source": "env"}
+    ]
+
+
+def test_mcp_accounts_tool_lists_env_account(monkeypatch):
+    from x2llm import mcp
+
+    monkeypatch.setenv("X_AUTH_TOKEN", "at")
+    monkeypatch.setenv("X_CT0", "ct")
+    assert asyncio.run(mcp._list_accounts()) == {
+        "accounts": [{"screen_name": "env", "updated_at": None, "default": True, "source": "env"}]
+    }
+
+
+def test_cli_accounts_list_shows_env_account(monkeypatch):
+    monkeypatch.setenv("X_AUTH_TOKEN", "at")
+    monkeypatch.setenv("X_CT0", "ct")
+    result = CliRunner().invoke(cli.cli, ["accounts", "list"])
+    assert result.exit_code == 0
+    assert json.loads(result.output)["accounts"][0]["screen_name"] == "env"
+
+
+def test_store_get_wire_does_not_create_db(db):
+    assert db.get_wire() == {}
+    assert not db.db_path().exists()
+
+
+def test_store_pg_missing_driver_is_store_error(db, monkeypatch):
+    """DATABASE_URL set but psycopg not importable -> actionable StoreError."""
+    import sys
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql://localhost/x")
+    monkeypatch.setitem(sys.modules, "psycopg", None)
+    with pytest.raises(db.StoreError, match=r"x2llm\[postgres\]"):
+        db._connect()
 
 
 # --- client / RPC layer --------------------------------------------------------
