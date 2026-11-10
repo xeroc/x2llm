@@ -191,9 +191,65 @@ hint instead of being retried — the right answer is to slow down.
 
 ## Environment Variables
 
-Credentials are **not** environment variables — they live in the account db
-(see [Getting Started](#getting-started)). The environment only carries
-infrastructure knobs:
+### Env-Injected Credentials (storeless deployments)
+
+The default account db is a machine-local sqlite file. To deploy the MCP
+server (or CLI) somewhere you don't want to ship that file, inject the
+session cookies via the environment instead:
+
+| Variable | Required | Description |
+|---|---|---|
+| `X_AUTH_TOKEN` | yes (with `X_CT0`) | The `auth_token` session cookie — this IS the account |
+| `X_CT0` | yes (with `X_AUTH_TOKEN`) | The `ct0` csrf cookie |
+| `X_ACCOUNT` | no | Screen-name label for the account (default `env`); tool `username` params must match it |
+| `X_BEARER` | no | Override the public web-client bearer |
+| `X_COOKIE` | no | Full cookie header override (e.g. to add `cf_clearance`) |
+| `X_USER_AGENT` | no | Override the default Firefox user agent |
+
+Env credentials win over any store, and `search`/`like` still work —
+transaction ids are minted on demand by txgen (there is simply no capture
+pool). Get the two cookie values from a logged-in browser (same place the
+HAR capture gets them: DevTools → Storage → Cookies for x.com); they expire
+on the same timescale as stored ones, so rotate by updating the env, not by
+re-importing.
+
+### Postgres Store
+
+Set `DATABASE_URL` (any libpq conninfo or URI) and the account store moves
+to postgres — same schema, same SQL, same commands (`import`, `accounts`,
+`--user`, MCP `username` all work unchanged). sqlite stays the default.
+
+```console
+$ pip install 'x2llm[postgres]'   # pulls psycopg
+$ export DATABASE_URL='postgresql://user:pass@db.example.com:5432/x2llm'
+$ x2llm import capture.har
+```
+
+The store is credential-shaped, not multi-writer-shaped: it opens one
+connection per operation (`# ponytail:` in store.py — pool it if store
+throughput ever matters; the X API rate limiter dominates anyway). Give the
+role exactly these privileges and nothing more:
+
+```sql
+CREATE ROLE x2llm LOGIN PASSWORD '...';
+CREATE DATABASE x2llm OWNER x2llm;
+-- optional hardening: read/write on the three tables, no DDL after first run
+-- REVOKE ALL ON DATABASE x2llm FROM PUBLIC; etc.
+```
+
+Precedence: `X_AUTH_TOKEN`/`X_CT0` (if set) beat `DATABASE_URL`, which beats
+the local sqlite file. Tables are created idempotently on first connect; the
+db holds live session secrets, so treat the postgres database like the
+sqlite file: restricted access, no public schemas, TLS in transit.
+
+To run the postgres dialect-conformance tests against a throwaway db:
+
+```console
+$ uv sync --extra postgres --inexact
+$ DATABASE_URL='postgresql://.../x2llm_test' uv run --extra postgres pytest tests/test_store_pg.py
+```
+
+### Infrastructure knobs
 
 | Variable | Description | Default |
 |---|---|---|
@@ -316,6 +372,38 @@ Ops without a captured id mint one via `txgen` (path-correct, always fresh),
 so a capture that never ran a search still searches. `search`/`like` only
 degrade if `txgen` itself breaks (x.com bundle change) — then a capture
 covering all operations (below) restores them.
+
+## Docker & Releases
+
+The image (`ghcr.io/xeroc/x2llm`, multi-stage: wheel built with uv, installed
+into `python:3.12-slim` with the postgres extra, runs as non-root `x2llm`)
+ships the CLI and the stdio MCP server — `docker run ghcr.io/xeroc/x2llm`
+defaults to `x2llm mcp`. No store is baked in; configure the same two ways
+as everywhere else: env credentials or `DATABASE_URL`.
+
+Point an MCP client at the container:
+
+```json
+{
+  "mcpServers": {
+    "x2llm": {
+      "command": "docker",
+      "args": ["run", "-i", "--rm",
+               "-e", "X_AUTH_TOKEN", "-e", "X_CT0",
+               "ghcr.io/xeroc/x2llm:latest"]
+    }
+  }
+}
+```
+
+Releasing (requires a clean tree, `docker login ghcr.io`, and push rights):
+
+```console
+$ make release              # bump patch, uv lock, commit, tag vX.Y.Z,
+                            # build+push image (:X.Y.Z and :latest), push git
+$ make release BUMP=minor   # or major
+$ make docker               # build-only, tagged :dev
+```
 
 ## Testing
 
