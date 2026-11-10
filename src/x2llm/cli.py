@@ -133,11 +133,14 @@ def following(user: str, limit: int, cursor: str | None) -> None:
 
 
 @cli.command()
-def mcp() -> None:
-    """Run as a stdio MCP server (same tool surface, read-only)."""
-    from .mcp import serve
+@click.option("--http", is_flag=True, help="Streamable HTTP at /mcp instead of stdio")
+@click.option("--host", default="127.0.0.1", show_default=True, help="HTTP bind host")
+@click.option("--port", default=8000, show_default=True, type=int, help="HTTP bind port")
+def mcp(http: bool, host: str, port: int) -> None:
+    """Run as an MCP server (stdio, or --http for streamable HTTP at /mcp)."""
+    from .mcp import serve, serve_http
 
-    asyncio.run(serve())
+    asyncio.run(serve_http(host, port) if http else serve())
 
 
 @cli.command("import")

@@ -1015,6 +1015,50 @@ def test_mcp_server_stdio_roundtrip():
         proc.terminate()
 
 
+async def test_mcp_http_endpoint_answers_initialize_and_tools(db, monkeypatch):
+    """--http mode: streamable HTTP at /mcp, exercised through ASGI transport."""
+    import httpx
+
+    from x2llm import mcp
+
+    _seed(db, "stored")
+    app = mcp.build_http_app()
+    headers = {"Accept": "application/json, text/event-stream", "Host": "127.0.0.1:8000"}
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
+            r = await client.post(
+                "/mcp",
+                headers=headers,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": {"name": "t", "version": "0"},
+                    },
+                },
+            )
+            assert r.status_code == 200
+            assert r.json()["result"]["serverInfo"]["name"] == "x2llm"
+
+            r = await client.post(  # stateless: tools work without initialize
+                "/mcp",
+                headers=headers,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {"name": "accounts", "arguments": {}},
+                },
+            )
+            assert r.status_code == 200
+            payload = json.loads(r.json()["result"]["content"][0]["text"])
+    assert [a["screen_name"] for a in payload["accounts"]] == ["stored"]
+
+
 def test_bind_tool_routes_username_to_client(monkeypatch, db):
     from x2llm import mcp as mcp_mod
 

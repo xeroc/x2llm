@@ -204,6 +204,34 @@ def build_mcp_server():
     return server
 
 
+def build_http_app(host: str = "127.0.0.1"):
+    """Starlette app serving MCP at /mcp (stateless streamable HTTP).
+
+    Loopback hosts get the SDK's DNS-rebinding protection (Host must carry
+    a port, e.g. 127.0.0.1:8000); non-loopback binds expect a reverse proxy
+    to own host validation.
+
+    # ponytail: stateless + json responses - no sticky sessions or SSE
+    # buffering behind a reverse proxy; go stateful if long event streams
+    # ever matter.
+    """
+    return build_mcp_server().streamable_http_app(
+        stateless_http=True, json_response=True, host=host
+    )
+
+
+async def serve_http(host: str, port: int) -> None:
+    import uvicorn
+
+    try:
+        runner = uvicorn.Server(uvicorn.Config(build_http_app(host), host=host, port=port))
+        await runner.serve()
+    finally:
+        for client in _MCP_CLIENTS.values():
+            await client.aclose()
+        _MCP_CLIENTS.clear()
+
+
 async def serve() -> None:
     server = build_mcp_server()
     try:
