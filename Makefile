@@ -4,7 +4,7 @@
 UV ?= uv
 IMAGE ?= ghcr.io/xeroc/x2llm
 BUMP ?= patch
-NV := $(shell date +%Y.%m.%d)
+NV := $(shell date +%Y.%m.%d%H%M)
 
 help: ## Show available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
