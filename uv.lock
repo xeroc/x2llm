@@ -881,7 +881,7 @@ wheels = [
 
 [[package]]
 name = "x2llm"
-version = "2026.11.111034"
+version = "2026.11.111143"
 source = { editable = "." }
 dependencies = [
     { name = "click" },
