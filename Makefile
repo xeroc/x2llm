@@ -29,9 +29,6 @@ fmt: ## Ruff autofix
 
 check: lint test ## Everything a change must pass
 
-docker: ## Build ghcr.io/xeroc/x2llm:dev from the working tree
-	docker build -t $(IMAGE):dev .
-
 release: ## Bump version (BUMP=patch|minor|major), commit, tag, build+push image, push git
 	@test -z "$$(git status --porcelain)" || { echo '!! clean working tree required'; exit 1; }; \
 	sed -i 's/version = .*$$/version = "$(NV)"/' pyproject.toml
@@ -41,6 +38,7 @@ release: ## Bump version (BUMP=patch|minor|major), commit, tag, build+push image
 	git commit -m "chore: release v$(NV)" && \
 	git tag v$(NV) && \
 	git push && git push origin v$(NV) || { echo '!! release incomplete - finish the remaining steps manually'; exit 1; }
+	make docker
 
 docker_build:
 	docker build --build-arg VERSION=$(NV) -t $(IMAGE):$(NV) -t $(IMAGE):latest .
