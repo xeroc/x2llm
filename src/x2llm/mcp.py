@@ -1,8 +1,9 @@
-"""Stdio MCP server exposing the same cores as the CLI (reads + like_tweet).
+"""Stdio MCP server exposing the same cores as the CLI (reads + write actions).
 
 Account selection is per tool call via the `username` parameter (omitted =
 the default account); the `accounts` tool lists what is stored.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -20,14 +21,18 @@ MCP_INSTRUCTIONS = (
     "selects the default account - the accounts tool marks it). "
     "Credentials expire - refresh them with a HAR capture or new env "
     "values (see the x2llm README). All tools are read-only except "
-    "like_tweet, which performs a REAL, publicly visible action and notifies "
-    "the author - never call it unless the user explicitly asked to like that "
-    "specific post. search supports X operators (from:user, "
-    "since:YYYY-MM-DD, lang:, min_faves:, min_retweets:). get_tweet returns "
-    "the tweet plus its reply thread; paginate long threads and searches with "
-    "the returned cursor. analytics returns the account's own engagement "
-    "statistics. If search or like fails with an empty 404, the captured "
-    "x-client-transaction-id expired - see the x2llm README."
+    "post_tweet, like_tweet and send_dm, which perform REAL actions: "
+    "post_tweet is public and permanent; like_tweet is publicly visible "
+    "and notifies the author; send_dm is private but notifies the "
+    "recipient and cannot be unsent. Never call any of them unless the "
+    "user explicitly asked for that exact action. search supports X "
+    "operators (from:user, since:YYYY-MM-DD, lang:, min_faves:, "
+    "min_retweets:). get_tweet returns the tweet plus its reply thread; "
+    "paginate long threads and searches with the returned cursor "
+    "(get_dm_conversation pages the same way). analytics returns the "
+    "account's own engagement statistics. If search or like fails with "
+    "an empty 404, the captured x-client-transaction-id expired - see "
+    "the x2llm README."
 )
 
 # (tool name, description, core, read_only)
@@ -85,7 +90,9 @@ MCP_TOOLS = [
     ),
     (
         "get_tweet",
-        ("One post by id plus its reply thread; cursor paginates deeper replies. Long-form articles come back under article (title, summary, full body as markdown)."),
+        (
+            "One post by id plus its reply thread; cursor paginates deeper replies. Long-form articles come back under article (title, summary, full body as markdown)."
+        ),
         cores.tweet,
         True,
     ),
@@ -106,11 +113,41 @@ MCP_TOOLS = [
     ),
     (
         "get_following",
-        (
-            "Accounts a user follows. user is a numeric id or screen name; cursor paginates."
-        ),
+        ("Accounts a user follows. user is a numeric id or screen name; cursor paginates."),
         cores.following,
         True,
+    ),
+    (
+        "list_dm_conversations",
+        (
+            "The account's DM inbox: recent conversations with participants, "
+            "last message and unread flags. Covers the ~30 most recent - "
+            "the inbox endpoint no longer pages deeper."
+        ),
+        cores.dm_inbox,
+        True,
+    ),
+    (
+        "get_dm_conversation",
+        (
+            "One DM conversation thread by id (from list_dm_conversations), "
+            "oldest to newest. cursor (a previous response's cursor) pages "
+            "into older history."
+        ),
+        cores.dm_conversation,
+        True,
+    ),
+    (
+        "send_dm",
+        (
+            "Send a direct message as the logged-in user. REAL action: "
+            "private, but notifies the recipient and cannot be unsent. "
+            "to is a screen name or a conversation id. Only call when the "
+            "user explicitly asked to send that exact message to that "
+            "exact recipient."
+        ),
+        cores.dm_send,
+        False,
     ),
     (
         "post_tweet",

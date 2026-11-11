@@ -11,6 +11,7 @@ import json
 import os
 import subprocess
 import sys
+import types
 import urllib.parse
 from datetime import UTC, datetime
 from pathlib import Path
@@ -486,13 +487,12 @@ def test_tweet_row_renders_article_body():
     assert art["title"] == "It's ORE's Time"
     assert art["published_at"] == "1970-01-01T00:00:00+00:00"
     assert art["cover_url"] == "https://pbs/cover.jpg"
-    assert art["text"] == (
-        "# H1\n\nBody.\n\n![image](https://pbs/a.jpg)\n\n---"
-    )
+    assert art["text"] == ("# H1\n\nBody.\n\n![image](https://pbs/a.jpg)\n\n---")
 
 
 def test_tweet_row_has_no_article_key_for_plain_tweets():
     assert "article" not in parse.collect_tweets(tweet_payload())[0]
+
 
 def test_tweet_row_prefers_note_tweet_text():
     payload = tweet_payload()
@@ -1006,7 +1006,7 @@ def test_mcp_server_stdio_roundtrip():
         replies = [json.loads(proc.stdout.readline()) for _ in range(2)]
         tools = {t["name"]: t for t in replies[1]["result"]["tools"]}
         assert replies[0]["result"]["serverInfo"]["name"] == "x2llm"
-        assert len(tools) == 13
+        assert len(tools) == 16
         assert "accounts" in tools and "search" in tools and "get_tweet" in tools
         assert "username" in tools["search"]["inputSchema"]["properties"]
         assert tools["accounts"]["inputSchema"].get("properties") in (None, {})
@@ -1233,3 +1233,218 @@ def test_store_capture_resolves_live_when_capture_is_silent(db, monkeypatch):
     monkeypatch.setattr(harvest, "resolve_session_name", lambda m: "xer0c")
     assert harvest.store_capture(MATERIAL, {}, None) == "xer0c"
     assert db.get_account("xer0c")["auth_token"] == "at"
+
+
+# --- dms -------------------------------------------------------------------------
+
+
+class FakeRoutingClient:
+    """Routes rest/rest_post/graphql calls to canned responses by substring."""
+
+    def __init__(self, routes, screen_name="fabian"):
+        self.routes = routes
+        self.screen_name = screen_name
+        self.calls = []
+        self.config = types.SimpleNamespace(screen_name=screen_name)
+
+    async def _route(self, kind, target, payload):
+        self.calls.append((kind, target, payload))
+        for frag, resp in self.routes:
+            if frag in target:
+                return resp
+        raise AssertionError(f"unexpected {kind} call: {target}")
+
+    async def rest(self, path, params):
+        return await self._route("rest", path, params)
+
+    async def aclose(self):
+        pass
+
+    async def rest_post(self, path, body):
+        return await self._route("rest_post", path, body)
+
+    async def graphql(self, key, variables):
+        return await self._route("graphql", key, variables)
+
+    async def graphql_post(self, key, variables):
+        return await self._route("post", key, variables)
+
+
+def _dm_user(uid, screen_name):
+    return {"id_str": uid, "screen_name": screen_name, "name": screen_name.upper()}
+
+
+def _dm_entry(mid, time, conv, sender, recipient, text):
+    return {
+        "message": {
+            "id": mid,
+            "time": time,
+            "conversation_id": conv,
+            "message_data": {
+                "id": mid,
+                "time": time,
+                "recipient_id": recipient,
+                "sender_id": sender,
+                "text": text,
+            },
+        }
+    }
+
+
+def dm_inbox_payload():
+    return {
+        "inbox_initial_state": {
+            "conversations": {
+                "111-222": {
+                    "conversation_id": "111-222",
+                    "type": "ONE_TO_ONE",
+                    "sort_event_id": "2120",
+                    "sort_timestamp": "1794000000000",
+                    "participants": [
+                        {"user_id": "111", "last_read_event_id": "2100"},
+                        {"user_id": "222"},
+                    ],
+                    "muted": False,
+                    "trusted": False,
+                    "status": "AT_END",
+                },
+                "111-333": {
+                    "conversation_id": "111-333",
+                    "type": "ONE_TO_ONE",
+                    "sort_event_id": "2000",
+                    "sort_timestamp": "1793000000000",
+                    "participants": [
+                        {"user_id": "111", "last_read_event_id": "2000"},
+                        {"user_id": "333"},
+                    ],
+                    "muted": True,
+                    "trusted": False,
+                    "status": "AT_END",
+                },
+            },
+            "entries": [
+                _dm_entry("2120", "1794000000000", "111-222", "222", "111", "latest from alice"),
+                _dm_entry("2000", "1793000000000", "111-333", "111", "333", "latest from viewer"),
+            ],
+            "users": {
+                "111": _dm_user("111", "fabian"),
+                "222": _dm_user("222", "alice"),
+                "333": _dm_user("333", "bob"),
+            },
+        }
+    }
+
+
+def test_dm_inbox_core_sorts_flags_and_resolves_names():
+    fake = FakeRoutingClient([("inbox_initial_state", dm_inbox_payload())])
+    result = _run(cores.dm_inbox(fake))
+    rows = result["conversations"]
+    assert [r["id"] for r in rows] == ["111-222", "111-333"]  # newest first
+    first, second = rows
+    assert first["with"] == "alice" and first["unread"] is True
+    assert first["last_message"]["text"] == "latest from alice"
+    assert first["last_message"]["sender"] == "alice"
+    assert first["participants"] == ["fabian", "alice"]
+    assert second["with"] == "bob" and second["unread"] is False and second["muted"] is True
+    assert second["last_message"]["sender"] == "fabian"
+    assert "cursor" not in result  # x.com removed 1.1 inbox paging
+
+
+def dm_thread_payload(status="HAS_MORE"):
+    return {
+        "conversation_timeline": {
+            "status": status,
+            "min_entry_id": "10",
+            "max_entry_id": "30",
+            "entries": [
+                _dm_entry("30", "1794000003000", "111-222", "111", "222", "c"),
+                _dm_entry("20", "1794000002000", "111-222", "222", "111", "b"),
+                _dm_entry("10", "1794000001000", "111-222", "222", "111", "a"),
+            ],
+            "users": {"111": _dm_user("111", "fabian"), "222": _dm_user("222", "alice")},
+        }
+    }
+
+
+def test_dm_conversation_core_orders_chronologically_and_pages():
+    fake = FakeRoutingClient([("conversation/111-222", dm_thread_payload())])
+    result = _run(cores.dm_conversation(fake, "111-222"))
+    assert [m["id"] for m in result["messages"]] == ["10", "20", "30"]
+    assert [m["sender"] for m in result["messages"]] == ["alice", "alice", "fabian"]
+    assert result["messages"][0]["time"] == "2026-11-06T21:20:01+00:00"
+    assert result["cursor"] == "10"  # min_entry_id while more history exists
+    _run(cores.dm_conversation(fake, "111-222", cursor="10"))
+    assert fake.calls[1][2] == {"max_id": "10"}
+
+
+def test_dm_conversation_cursor_null_at_end():
+    fake = FakeRoutingClient([("conversation/111-222", dm_thread_payload(status="AT_END"))])
+    result = _run(cores.dm_conversation(fake, "111-222"))
+    assert result["cursor"] is None
+
+
+def dm_send_event():
+    """new2.json answers with an inbox-style entries/users blob."""
+    return {
+        "entries": [_dm_entry("2121", "1794100000000", "111-222", "111", "222", "hi there")],
+        "users": {"111": _dm_user("111", "fabian"), "222": _dm_user("222", "alice")},
+    }
+
+
+def test_dm_send_to_screen_name_uses_existing_conversation():
+    fake = FakeRoutingClient(
+        [("inbox_initial_state", dm_inbox_payload()), ("new2.json", dm_send_event())]
+    )
+    result = _run(cores.dm_send(fake, "alice", "hi there"))
+    post = [c for c in fake.calls if c[0] == "rest_post"]
+    assert post == [
+        ("rest_post", "/1.1/dm/new2.json", {"conversation_id": "111-222", "text": "hi there"})
+    ]
+    assert result["sent"] is True
+    assert result["conversation_id"] == "111-222"
+    assert result["message"] == {
+        "id": "2121",
+        "time": "2026-11-08T01:06:40+00:00",
+        "sender": "fabian",
+        "text": "hi there",
+    }
+
+
+def test_dm_send_new_chat_resolves_profile_and_builds_conversation_id():
+    fake = FakeRoutingClient(
+        [
+            ("inbox_initial_state", dm_inbox_payload()),
+            (
+                "user",
+                {
+                    "data": {
+                        "user": {"result": {"rest_id": "444", "core": {"screen_name": "carol"}}}
+                    }
+                },
+            ),
+            ("new2.json", dm_send_event()),
+        ]
+    )
+    result = _run(cores.dm_send(fake, "carol", "first contact"))
+    post = [c for c in fake.calls if c[0] == "rest_post"]
+    assert post[0][2]["conversation_id"] == "111-444"  # numerically sorted pair
+    assert result["sent"] is True
+
+
+def test_dm_send_explicit_conversation_id_skips_inbox():
+    fake = FakeRoutingClient([("new2.json", dm_send_event())])
+    _run(cores.dm_send(fake, "111-222", "direct"))
+    kinds = [c[0] for c in fake.calls]
+    assert kinds == ["rest_post"]
+    assert fake.calls[0][2]["conversation_id"] == "111-222"
+
+
+def test_cli_dms_json_out(monkeypatch, db):
+    _seed(db)
+    monkeypatch.setattr(
+        cli, "XClient", lambda cfg: FakeRoutingClient([("inbox_initial_state", dm_inbox_payload())])
+    )
+    result = CliRunner().invoke(cli.cli, ["dms"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["conversations"][0]["with"] == "alice"

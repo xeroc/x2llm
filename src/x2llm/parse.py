@@ -1,4 +1,5 @@
 """Parsers: x.com timeline/negotiation blobs -> flat LLM-friendly dicts."""
+
 from __future__ import annotations
 
 from collections.abc import Iterator
@@ -107,8 +108,12 @@ def article_row(article: dict | None) -> dict | None:
         "summary_text": result.get("summary_text"),
         "published_at": _iso((result.get("metadata") or {}).get("first_published_at_secs")),
         "modified_at": _iso((result.get("lifecycle_state") or {}).get("modified_at_secs")),
-        "cover_url": ((result.get("cover_media") or {}).get("media_info") or {}).get("original_img_url"),
-        "text": _render_blocks(state.get("blocks") or [], _entity_values(state.get("entityMap")), media),
+        "cover_url": ((result.get("cover_media") or {}).get("media_info") or {}).get(
+            "original_img_url"
+        ),
+        "text": _render_blocks(
+            state.get("blocks") or [], _entity_values(state.get("entityMap")), media
+        ),
     }
     return {k: v for k, v in row.items() if v}
 
@@ -201,3 +206,103 @@ def user_row(result: dict) -> dict:
         "media_tweets": counts.get("media_tweets"),
         "blue_verified": result.get("is_blue_verified"),
     }
+
+
+def iso_ms(ms: Any) -> str | None:
+    """DM timestamps are epoch milliseconds, as strings or ints."""
+    if isinstance(ms, str) and ms.isdigit():
+        ms = int(ms)
+    if isinstance(ms, (int, float)):
+        return datetime.fromtimestamp(ms / 1000, tz=UTC).isoformat()
+    return None
+
+
+def _dm_screen_name(users: dict, uid: Any) -> str | None:
+    return (users.get(str(uid)) or {}).get("screen_name")
+
+
+def dm_conversation_rows(state: dict, viewer_screen_name: str) -> list[dict]:
+    """inbox_initial_state -> flat conversation rows, newest first.
+
+    The inbox ships ~30 conversations with preview entries; ids resolve
+    through the users map (the viewer's own row is how we learn its id).
+    """
+    users = state.get("users") or {}
+    viewer = next(
+        (
+            u
+            for u in users.values()
+            if str(u.get("screen_name", "")).lower() == viewer_screen_name.lower()
+        ),
+        None,
+    )
+    viewer_id = str(viewer.get("id_str")) if viewer else None
+    last: dict[str, dict] = {}
+    for e in state.get("entries") or []:
+        m = e.get("message") or {}
+        md = m.get("message_data") or {}
+        cid = m.get("conversation_id")
+        seen = last.get(cid)
+        if cid and (seen is None or int(m.get("id") or 0) > int(seen["id"] or 0)):
+            last[cid] = {
+                "id": m.get("id"),
+                "time": iso_ms(md.get("time")),
+                "sender": _dm_screen_name(users, md.get("sender_id")),
+                "text": md.get("text"),
+            }
+    rows: list[dict] = []
+    convs = sorted(
+        (state.get("conversations") or {}).values(),
+        key=lambda conv: int(conv.get("sort_timestamp") or 0),
+        reverse=True,
+    )
+    for conv in convs:
+        parts = [str(p.get("user_id")) for p in conv.get("participants") or []]
+        row: dict = {
+            "id": conv.get("conversation_id"),
+            "type": conv.get("type"),
+            "participants": [_dm_screen_name(users, p) for p in parts],
+            "unread": None,
+            "muted": conv.get("muted"),
+            "trusted": conv.get("trusted"),
+        }
+        if conv.get("type") == "ONE_TO_ONE":
+            other = next((p for p in parts if p != viewer_id), None)
+            if other:
+                row["with"] = _dm_screen_name(users, other)
+        if viewer_id:
+            read = next(
+                (
+                    str(p.get("last_read_event_id") or 0)
+                    for p in conv.get("participants") or []
+                    if str(p.get("user_id")) == viewer_id
+                ),
+                "0",
+            )
+            row["unread"] = int(conv.get("sort_event_id") or 0) > int(read)
+        if lm := last.get(conv.get("conversation_id")):
+            row["last_message"] = lm
+        rows.append(row)
+    return rows
+
+
+def dm_message_rows(timeline: dict) -> list[dict]:
+    """conversation_timeline entries -> chronological rows (oldest first)."""
+    users = timeline.get("users") or {}
+    rows: list[dict] = []
+    for e in timeline.get("entries") or []:
+        m = e.get("message") or {}
+        md = m.get("message_data") or {}
+        row = {
+            "id": m.get("id"),
+            "time": iso_ms(md.get("time")),
+            "sender": _dm_screen_name(users, md.get("sender_id")),
+            "text": md.get("text"),
+        }
+        media = (md.get("attachment") or {}).get("media") or {}
+        if media:
+            # ponytail: photo/video urls only; cards/voice/geo not extracted
+            row["attachment"] = {"type": media.get("type"), "url": media.get("media_url_https")}
+        rows.append(row)
+    rows.reverse()  # the api answers newest-first
+    return rows

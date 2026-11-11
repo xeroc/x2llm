@@ -1,10 +1,11 @@
 """XClient: the only module that knows how x.com RPC works.
 
-Everything above this layer deals in plain dicts. Three primitives:
+Everything above this layer deals in plain dicts. Four primitives:
 
 - graphql(key, variables) -> dict          (GET /i/api/graphql/<queryId>/<Op>)
 - graphql_post(key, variables) -> dict    (POST /i/api/graphql/... — feeds + writes)
 - rest(path, params) -> dict               (GET /i/api/1.1/... legacy REST)
+- rest_post(path, body) -> dict            (POST /i/api/1.1/... — the dm write)
 
 Auth = public web bearer + cookie session (auth_token + ct0) + x-csrf-token
 mirroring ct0. Some endpoints additionally validate x-client-transaction-id
@@ -18,6 +19,7 @@ Transaction ids (x-client-transaction-id) are minted on demand by TxidFactory
 Manual entries in the account store's txids column override the generator
 per operation.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -36,6 +38,7 @@ class XApiError(Exception):
     def __init__(self, message: str, status: int | None = None):
         super().__init__(message)
         self.status = status
+
 
 class XClient:
     def __init__(self, config: Config, transport: httpx.AsyncBaseTransport | None = None):
@@ -57,7 +60,6 @@ class XClient:
         await self._http.aclose()
         if self._txgen is not None:
             await self._txgen.aclose()
-
 
     async def graphql(self, key: str, variables: dict) -> dict:
         ep = self._op(key)
@@ -97,6 +99,14 @@ class XClient:
         await self._throttle()
         response = await self._http.get(
             f"{self.config.api_base}{path}", params=params, headers=self._headers(None)
+        )
+        return self._json(response, path)
+
+    async def rest_post(self, path: str, body: dict) -> dict:
+        """POST legacy REST with a JSON body - the dm write primitive."""
+        await self._throttle()
+        response = await self._http.post(
+            f"{self.config.api_base}{path}", json=body, headers=self._headers(None)
         )
         return self._json(response, path)
 

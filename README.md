@@ -4,9 +4,9 @@ x.com (Twitter) client for LLM agents. Multiple accounts in a local sqlite
 store, three faces: a Python library, a `click` CLI, and a stdio MCP
 server. Built for machines first: every command prints exactly one JSON
 document (`x2llm prime` is the one markdown exception - an agent briefing),
-every error prints `{"error": "..."}` and exits non-zero. Everything
-is read-only **except one deliberate write: `like`** — no posting, replying,
-following, or DMing.
+every error prints `{"error": "..."}` and exits non-zero. Reads plus
+three deliberate writes: `post`, `like`, and `dm-send` — each marked
+REAL everywhere and gated on explicit user intent.
 
 ## Key Features
 
@@ -17,7 +17,8 @@ following, or DMing.
 - Notification tab reading
 - Account analytics (impressions, likes, follows — your own statistics page)
 - Follower/following graphs, typeahead suggestions, unread badge counts
-- Like a tweet (the single write action, explicit everywhere)
+- Post a tweet, like a tweet (write actions, explicit everywhere)
+- Direct messages: inbox (`dms`), thread history (`dm`), sending (`dm-send`)
 - Same core functions power both CLI and MCP server
 
 ## Tech Stack
@@ -121,8 +122,7 @@ make install       # uv tool install — puts `x2llm` on your PATH
 │   ├── store.py         # sqlite account store (screen_name → credentials)
 │   ├── registry.py      # wire constants (query ids, features, toggles) - plain tracked source
 │   ├── client.py        # XClient — the ONLY module that knows the RPC protocol
-│   ├── parse.py         # response-blob walkers → flat dicts (tweet/user/cursor rows)
-│   ├── cores.py         # 8 async service cores, shared by CLI and MCP
+│   ├── cores.py         # 15 async service cores, shared by CLI and MCP
 │   ├── cli.py           # click commands, one JSON doc per command
 │   └── mcp.py           # stdio MCP server wrapping the same cores
 ├── tests/test_x2llm.py  # offline: MockTransport, FakeClient, CliRunner, stdio roundtrip
@@ -135,12 +135,13 @@ make install       # uv tool install — puts `x2llm` on your PATH
 click command / MCP tool
         │
         ▼
-cores.py  (search, tweet, notifications, … like — dicts in, dicts out)
+cores.py  (search, tweet, notifications, … like, dm-send — dicts in, dicts out)
         │
         ▼
 XClient.graphql(key, variables)          — reads
-XClient.graphql_post(key, variables)    — POST GraphQL (home feed, like write)
-XClient.rest(path, params)               — legacy REST reads
+XClient.graphql_post(key, variables)    — POST GraphQL (home feed, like/post writes)
+XClient.rest(path, params)               — legacy REST reads (dms, dm threads)
+XClient.rest_post(path, body)            — legacy REST write (dm-send)
         │   builds URL: GET https://x.com/i/api/graphql/<queryId>/<Operation>
         │             ?variables=<json>&features=<json>
         │   attaches: bearer, cookie session, x-csrf-token (== ct0),
@@ -152,7 +153,7 @@ httpx.AsyncClient
 x.com → 200 JSON (or XApiError with a human hint)
         │
         ▼
-parse.py walkers (walk / collect_tweets / collect_cursors / notification_rows)
+parse.py walkers (walk / collect_tweets / collect_cursors / dm_conversation_rows)
         │
         ▼
 flat JSON row: {id, author, text, likes, views, …}
@@ -173,21 +174,22 @@ hint instead of being retried — the right answer is to slow down.
   header is. Wire data comes from `registry.py` defaults, overridden per
   operation by the account db's wire table (written by `x2llm import`).
 - **Cores are transport-agnostic.** They call `graphql(key, variables)` /
-  `graphql_mutation(key, variables)` / `rest(path, params)` — anything with
-  those three async methods works (see `FakeClient` in the tests). This is
-  what keeps the suite offline.
+  `graphql_post(key, variables)` / `rest(path, params)` /
+  `rest_post(path, body)` — anything with those four async methods works
+  (see `FakeClient` in the tests). This is what keeps the suite offline.
 - **One code path.** CLI handlers and MCP tools bind the same core functions;
   behavior can never drift between the two surfaces.
 - **Writes are isolated.** Read feeds are GET, except POST-fed timelines
-  (home — the browser itself scrolls via POST). The single write,
-  `like`, shares the POST primitive but nothing else does. The MCP server
-  registers it with `read_only_hint=false` and a loud description.
+  (home — the browser itself scrolls via POST). Writes are `like`/`post`
+  (GraphQL POST) and `dm-send` (REST POST). The MCP server registers all
+  three with `read_only_hint=false` and loud descriptions.
 - **One pagination model.** Every list core (`home`, `search`, `tweet`,
-  `notifications`, `following`) returns a `cursor`; feed it back for the next
-  page, `null` means end. The home timeline has two tabs served by different
-  operations: `for_you` (HomeTimeline, algorithmic) and `following`
-  (HomeLatestTimeline, chronological) — cursors are tab-specific, pass back
-  what the same tab returned.
+  `notifications`, `following`, `dm`) returns a `cursor`; feed it back for
+  the next page, `null` means end. The home timeline has two tabs served by
+  different operations: `for_you` (HomeTimeline, algorithmic) and
+  `following` (HomeLatestTimeline, chronological) — cursors are
+  tab-specific, pass back what the same tab returned. The DM inbox (`dms`)
+  has no cursor: x.com removed paging from the 1.1 inbox endpoint.
 
 ## Environment Variables
 
@@ -279,11 +281,17 @@ account; omitted, the default account is used.
 | `x2llm tweet ID [--cursor C]` | Tweet + reply thread |
 | `x2llm notifications [--limit N] [--cursor C]` | Notification tab |
 | `x2llm following USER [--limit N] [--cursor C]` | Accounts USER follows (id or screen name) |
+| `x2llm dms` | DM inbox: recent conversations with last message and unread flags (~30 most recent; the endpoint no longer pages) |
+| `x2llm dm CONVERSATION_ID [--cursor C]` | One DM thread, oldest to newest |
 | `x2llm like TWEET_ID` | **Like a tweet — real, public, notifies the author** |
+| `x2llm post TEXT [--reply-to ID]` | **Post a tweet — real, public, permanent** |
+| `x2llm dm-send USER_or_ID TEXT` | **Send a DM — real, private, notifies the recipient, cannot be unsent** |
 | `x2llm mcp` | Run as stdio MCP server |
 
 All pagination works the same way: the response carries a `cursor`; feed it
-back via `--cursor` for the next page (`null` means end).
+back via `--cursor` for the next page (`null` means end). `dms` is the one
+exception — x.com removed deeper paging from the inbox endpoint, so it
+always answers with the ~30 most recent conversations.
 
 Example — search, take the cursor, get page two:
 
@@ -294,14 +302,15 @@ uv run x2llm search "solana lang:en min_faves:100" --limit 10 --cursor 'DAACCgAC
 
 ## MCP Server
 
-`x2llm mcp` speaks MCP over stdio with 13 tools — the same cores as the CLI,
+`x2llm mcp` speaks MCP over stdio with 16 tools — the same cores as the CLI,
 plus `accounts`. Account selection is per tool call: every tool takes an
 optional `username` parameter (omitted = the default account, marked by the
 `accounts` tool; an unset default is an error that says how to pick one —
-Eleven tools are
+see the CLI Reference above). Fourteen tools are
 annotated `read_only_hint` (`accounts`, `get_home_timeline`, `get_user`,
 `get_badges`, `me`, `suggest`, `search`, `get_tweet`, `get_notifications`,
-`get_analytics`, `get_following`); `like_tweet` and `post_tweet` are the
+`get_analytics`, `get_following`, `list_dm_conversations`,
+`get_dm_conversation`); `post_tweet`, `like_tweet` and `send_dm` are the
 writes, registered with `read_only_hint=false` and descriptions that
 instruct agents to call them only on explicit user request. Liking an
 already-liked tweet returns the server's idempotent rejection

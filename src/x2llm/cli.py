@@ -46,7 +46,7 @@ def invoke(make_coro) -> None:
     default=None,
 )
 def cli(username: str | None) -> None:
-    """x2llm - read-only x.com (Twitter) API client for agents. JSON out."""
+    """x2llm - x.com (Twitter) API client for agents (reads + REAL write actions). JSON out."""
     click.get_current_context().obj = {"username": username}
 
 
@@ -114,6 +114,31 @@ def tweet(tweet_id: str, cursor: str | None) -> None:
 def notifications(limit: int, cursor: str | None) -> None:
     """Your notification tab."""
     invoke(lambda c: cores.notifications(c, limit=limit, cursor=cursor))
+
+
+@cli.command()
+def dms() -> None:
+    """Your DM inbox: recent conversations with last message and unread flags."""
+    invoke(lambda c: cores.dm_inbox(c))
+
+
+@cli.command()
+@click.argument("conversation_id")
+@click.option(
+    "--cursor", default=None, help="Pagination cursor from a previous page (older messages)."
+)
+def dm(conversation_id: str, cursor: str | None) -> None:
+    """One DM conversation thread (from `dms`), oldest to newest."""
+    invoke(lambda c: cores.dm_conversation(c, conversation_id, cursor=cursor))
+
+
+@cli.command("dm-send")
+@click.argument("to")
+@click.argument("text")
+def dm_send_cmd(to: str, text: str) -> None:
+    """Send a DM to @USER or a conversation id. REAL action: private, but
+    notifies the recipient and cannot be unsent."""
+    invoke(lambda c: cores.dm_send(c, to, text))
 
 
 @cli.command()

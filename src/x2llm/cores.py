@@ -1,11 +1,20 @@
-"""Service cores - shared by CLI and MCP server. Reads + the like mutation."""
+"""Service cores - shared by CLI and MCP server. Reads + the write actions."""
+
 from __future__ import annotations
 
 import base64
+import re
 from datetime import UTC, datetime
 
 from .client import XApiError
-from .parse import collect_cursors, collect_tweets, notification_rows, user_row
+from .parse import (
+    collect_cursors,
+    collect_tweets,
+    dm_conversation_rows,
+    dm_message_rows,
+    notification_rows,
+    user_row,
+)
 
 DAY_MS = 86_400_000
 
@@ -196,18 +205,24 @@ async def user(c, screen_name: str) -> dict:
 
 async def home(c, limit: int = 20, cursor: str | None = None, tab: str = "for_you") -> dict:
     if tab == "following":
-        key, variables = "home_following", {
-            "count": limit,
-            "enableRanking": True,
-            "includePromotedContent": True,
-        }
+        key, variables = (
+            "home_following",
+            {
+                "count": limit,
+                "enableRanking": True,
+                "includePromotedContent": True,
+            },
+        )
     else:
-        key, variables = "home", {
-            "count": limit,
-            "includePromotedContent": True,
-            "withCommunity": True,
-            "requestContext": "ptr",
-        }
+        key, variables = (
+            "home",
+            {
+                "count": limit,
+                "includePromotedContent": True,
+                "withCommunity": True,
+                "requestContext": "ptr",
+            },
+        )
     if cursor:
         variables["cursor"] = cursor
     data = await c.graphql_post(key, variables)
@@ -234,4 +249,84 @@ async def post_tweet(c, text: str, reply_to: str | None = None) -> dict:
     errors = data.get("errors") or []
     if errors:
         return {"posted": False, "detail": errors[0].get("message")}
-    return {"posted": True, "id": tweet.get("rest_id"), "text": (tweet.get("legacy") or {}).get("full_text")}
+    return {
+        "posted": True,
+        "id": tweet.get("rest_id"),
+        "text": (tweet.get("legacy") or {}).get("full_text"),
+    }
+
+
+DM_INBOX = "/1.1/dm/inbox_initial_state.json"
+_CONVERSATION_ID = re.compile(r"^\d+-\d+$")
+
+
+async def dm_inbox(c) -> dict:
+    """The account's DM inbox. The 1.1 endpoint answers with the ~30 most
+    recent conversations and x.com removed deeper paging from it, so no
+    cursor: open a conversation with `dm`/get_dm_conversation for history.
+    """
+    state = (await c.rest(DM_INBOX, {"supports_reactions": "true"})).get(
+        "inbox_initial_state"
+    ) or {}
+    return {"conversations": dm_conversation_rows(state, c.config.screen_name)}
+
+
+async def dm_conversation(c, conversation_id: str, cursor: str | None = None) -> dict:
+    """One DM thread, oldest to newest. cursor (a previous min_entry_id)
+    pages into older history while the endpoint reports more."""
+    tl = (
+        await c.rest(
+            f"/1.1/dm/conversation/{conversation_id}.json", {"max_id": cursor} if cursor else {}
+        )
+    ).get("conversation_timeline") or {}
+    return {
+        "conversation": conversation_id,
+        "messages": dm_message_rows(tl),
+        "cursor": tl.get("min_entry_id") if tl.get("status") not in ("AT_END", None) else None,
+    }
+
+
+async def dm_send(c, to: str, text: str) -> dict:
+    """Send a DM. `to` is @screen_name or an explicit a-b conversation id.
+    1:1 conversation ids are the two numeric user ids joined low-high."""
+    name = to.lstrip("@")
+    if _CONVERSATION_ID.match(name):
+        cid = name
+    else:
+        cid = await _dm_conversation_id(c, name)
+    data = await c.rest_post("/1.1/dm/new2.json", {"conversation_id": cid, "text": text})
+    rows = dm_message_rows({"entries": data.get("entries") or [], "users": data.get("users") or {}})
+    message = rows[-1] if rows else {"id": None, "time": None, "sender": None, "text": text}
+    return {"sent": True, "conversation_id": cid, "to": name, "message": message}
+
+
+async def _dm_conversation_id(c, name: str) -> str:
+    """Resolve @name to a 1:1 conversation id: both sides' numeric ids come
+    from the inbox users map; someone never chatted with resolves through
+    the profile api."""
+    state = (await c.rest(DM_INBOX, {"supports_reactions": "true"})).get(
+        "inbox_initial_state"
+    ) or {}
+    users = state.get("users") or {}
+
+    def find(screen_name: str):
+        return next(
+            (
+                u
+                for u in users.values()
+                if str(u.get("screen_name", "")).lower() == screen_name.lower()
+            ),
+            None,
+        )
+
+    viewer = find(c.config.screen_name)
+    if viewer is None:
+        raise XApiError(
+            f"dm-send: could not resolve your own user id from the inbox as @{c.config.screen_name}"
+        )
+    other = find(name)
+    other_id = str(other.get("id_str")) if other else (await user(c, name)).get("id")
+    if not other_id:
+        raise XApiError(f"dm-send: no such user @{name}")
+    low, high = sorted((str(viewer.get("id_str")), other_id), key=int)
+    return f"{low}-{high}"
