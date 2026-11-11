@@ -184,12 +184,15 @@ hint instead of being retried — the right answer is to slow down.
   (GraphQL POST) and `dm-send` (REST POST). The MCP server registers all
   three with `read_only_hint=false` and loud descriptions.
 - **One pagination model.** Every list core (`home`, `search`, `tweet`,
-  `notifications`, `following`, `dm`) returns a `cursor`; feed it back for
-  the next page, `null` means end. The home timeline has two tabs served by
-  different operations: `for_you` (HomeTimeline, algorithmic) and
-  `following` (HomeLatestTimeline, chronological) — cursors are
-  tab-specific, pass back what the same tab returned. The DM inbox (`dms`)
-  has no cursor: x.com removed paging from the 1.1 inbox endpoint.
+  `notifications`, `following`, `dm`, `dms`) returns a `cursor`; feed it
+  back for the next page, `null` means end. The home timeline has two tabs
+  served by different operations: `for_you` (HomeTimeline, algorithmic)
+  and `following` (HomeLatestTimeline, chronological) — cursors are
+  tab-specific, pass back what the same tab returned. `dms` pages across
+  two stacks: page 1 is the legacy 1.1 inbox (~30 conversations, plaintext
+  previews, unread flags); deeper pages walk the XChat inbox on
+  api.x.com GraphQL (50/page, every conversation ever, E2E-encrypted
+  bodies so previews are metadata-only).
 
 ## Environment Variables
 
@@ -281,7 +284,7 @@ account; omitted, the default account is used.
 | `x2llm tweet ID [--cursor C]` | Tweet + reply thread |
 | `x2llm notifications [--limit N] [--cursor C]` | Notification tab |
 | `x2llm following USER [--limit N] [--cursor C]` | Accounts USER follows (id or screen name) |
-| `x2llm dms` | DM inbox: recent conversations with last message and unread flags (~30 most recent; the endpoint no longer pages) |
+| `x2llm dms [--cursor C]` | DM inbox; `--cursor` walks deeper pages (E2EE: metadata-only previews beyond page 1) |
 | `x2llm dm CONVERSATION_ID [--cursor C]` | One DM thread, oldest to newest |
 | `x2llm like TWEET_ID` | **Like a tweet — real, public, notifies the author** |
 | `x2llm post TEXT [--reply-to ID]` | **Post a tweet — real, public, permanent** |
@@ -289,9 +292,10 @@ account; omitted, the default account is used.
 | `x2llm mcp` | Run as stdio MCP server |
 
 All pagination works the same way: the response carries a `cursor`; feed it
-back via `--cursor` for the next page (`null` means end). `dms` is the one
-exception — x.com removed deeper paging from the inbox endpoint, so it
-always answers with the ~30 most recent conversations.
+back via `--cursor` for the next page (`null` means end). For `dms`, page 1
+carries plaintext previews; deeper pages (XChat inbox) list every
+conversation ever but with metadata-only previews — message bodies there
+are end-to-end encrypted.
 
 Example — search, take the cursor, get page two:
 

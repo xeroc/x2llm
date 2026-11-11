@@ -117,9 +117,14 @@ def notifications(limit: int, cursor: str | None) -> None:
 
 
 @cli.command()
-def dms() -> None:
-    """Your DM inbox: recent conversations with last message and unread flags."""
-    invoke(lambda c: cores.dm_inbox(c))
+@click.option(
+    "--cursor", default=None, help="Pagination cursor from a previous page (deeper conversations)."
+)
+def dms(cursor: str | None) -> None:
+    """Your DM inbox: recent conversations with last message and unread
+    flags. --cursor walks deeper pages (XChat inbox; previews there are
+    metadata-only since message bodies are E2E-encrypted)."""
+    invoke(lambda c: cores.dm_inbox(c, cursor=cursor))
 
 
 @cli.command()

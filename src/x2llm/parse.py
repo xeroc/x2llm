@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from typing import Any
@@ -305,4 +306,68 @@ def dm_message_rows(timeline: dict) -> list[dict]:
             row["attachment"] = {"type": media.get("type"), "url": media.get("media_url_https")}
         rows.append(row)
     rows.reverse()  # the api answers newest-first
+    return rows
+
+
+def _tlv_decode(blob: bytes) -> dict[int, list[bytes]]:
+    """XChat event envelope: 0x0b | field u16be | length u32be | value."""
+    out: dict[int, list[bytes]] = {}
+    i = 0
+    while i + 7 <= len(blob) and blob[i] == 0x0B:
+        fid = int.from_bytes(blob[i + 1 : i + 3], "big")
+        ln = int.from_bytes(blob[i + 3 : i + 7], "big")
+        out.setdefault(fid, []).append(blob[i + 7 : i + 7 + ln])
+        i += 7 + ln
+    return out
+
+
+def _xchat_last_event(encoded: str | None) -> dict | None:
+    """Latest-message metadata from a base64 event blob: sequence id,
+    sender id, time. Message text is E2E-encrypted and stays opaque."""
+    if not encoded:
+        return None
+    try:
+        rec = _tlv_decode(base64.b64decode(encoded))
+    except ValueError:
+        return None
+    seq = rec.get(1, [b""])[0].decode(errors="replace")
+    uid = rec.get(3, [b""])[0].decode(errors="replace")
+    time_ms = rec.get(6, [b""])[0].decode(errors="replace")
+    return {"id": seq or None, "sender_id": uid or None, "time": iso_ms(time_ms)}
+
+
+def xchat_conversation_rows(items: list[dict]) -> list[dict]:
+    """XChat inbox page items -> flat conversation rows. Conversation ids
+    are normalized to the legacy low-high dash form so `dm` accepts them;
+    participants list the OTHER side only (the viewer is implied)."""
+    rows: list[dict] = []
+    for item in items:
+        cd = item.get("conversation_detail") or {}
+        cid = (cd.get("conversation_id") or "").replace(":", "-")
+        names: dict[str, str] = {}
+        parts: list[str] = []
+        for pr in cd.get("participants_results") or []:
+            uid = str(pr.get("rest_id") or "")
+            core = ((pr.get("result") or {}).get("core")) or {}
+            name = core.get("screen_name") or uid
+            names[uid] = name
+            parts.append(name)
+        row: dict = {
+            "id": cid,
+            "type": "ONE_TO_ONE" if len(parts) == 1 else "GROUP",
+            "participants": parts,
+            "muted": cd.get("is_muted"),
+        }
+        if len(parts) == 1:
+            row["with"] = parts[0]
+        last = _xchat_last_event((item.get("latest_message_events") or [None])[0])
+        if last:
+            row["last_message"] = {
+                "id": last["id"],
+                "time": last["time"],
+                "sender": names.get(last["sender_id"] or "", last["sender_id"]),
+            }
+        if item.get("is_deleted_by_viewer"):
+            row["deleted_by_viewer"] = True
+        rows.append(row)
     return rows

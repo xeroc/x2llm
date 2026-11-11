@@ -14,6 +14,7 @@ from .parse import (
     dm_message_rows,
     notification_rows,
     user_row,
+    xchat_conversation_rows,
 )
 
 DAY_MS = 86_400_000
@@ -258,29 +259,69 @@ async def post_tweet(c, text: str, reply_to: str | None = None) -> dict:
 
 DM_INBOX = "/1.1/dm/inbox_initial_state.json"
 _CONVERSATION_ID = re.compile(r"^\d+-\d+$")
+_XCHAT_SETTINGS = {
+    "conversation_event_limit": 200,
+    "inbox_conversation_event_limit": 5,
+    "inbox_conversation_limit": 50,
+    "user_event_limit": 500,
+}
+# client-storage version stamp echoed by the server; from the web client
+_XCHAT_PULL_VERSION = 1788882958
 
 
-async def dm_inbox(c) -> dict:
-    """The account's DM inbox. The 1.1 endpoint answers with the ~30 most
-    recent conversations and x.com removed deeper paging from it, so no
-    cursor: open a conversation with `dm`/get_dm_conversation for history.
+async def dm_inbox(c, cursor: str | None = None) -> dict:
+    """The DM inbox, paginated. First page: the 1.1 inbox - ~30 recent
+    conversations WITH plaintext previews and unread flags. Deeper pages
+    walk the XChat inbox (50/page, api.x.com GraphQL): every conversation
+    ever, but previews are E2E-encrypted so rows carry metadata only.
+    Cursor format: "<cursor_id>|<graph_snapshot_id>"; "0|" = first XChat page.
     """
-    state = (await c.rest(DM_INBOX, {"supports_reactions": "true"})).get(
-        "inbox_initial_state"
-    ) or {}
-    return {"conversations": dm_conversation_rows(state, c.config.screen_name)}
+    if not cursor:
+        state = (await c.rest(DM_INBOX, {"supports_reactions": "true"})).get(
+            "inbox_initial_state"
+        ) or {}
+        return {"conversations": dm_conversation_rows(state, c.config.screen_name), "cursor": "0|"}
+    offset, _, snapshot = cursor.partition("|")
+    if offset == "0":
+        data = await c.graphql(
+            "xchat_inbox",
+            {
+                "max_local_sequence_id": "1",
+                "query_settings": _XCHAT_SETTINGS,
+                "message_pull_version": _XCHAT_PULL_VERSION,
+            },
+        )
+        page = (data.get("data") or {}).get("get_initial_chat_page") or {}
+    else:
+        data = await c.graphql(
+            "xchat_inbox_page",
+            {
+                "continue_cursor": {
+                    "cursor_id": offset,
+                    "graph_snapshot_id": snapshot,
+                    "graph_snapshot_restarted": False,
+                },
+                "query_settings": _XCHAT_SETTINGS,
+            },
+        )
+        page = (data.get("data") or {}).get("get_inbox_page") or {}
+    cur = page.get("inboxCursor") or {}
+    nxt = None
+    if cur.get("cursor_id") is not None and not cur.get("inbox_exhausted"):
+        nxt = f"{cur['cursor_id']}|{cur.get('graph_snapshot_id') or ''}"
+    return {"conversations": xchat_conversation_rows(page.get("items") or []), "cursor": nxt}
 
 
 async def dm_conversation(c, conversation_id: str, cursor: str | None = None) -> dict:
-    """One DM thread, oldest to newest. cursor (a previous min_entry_id)
-    pages into older history while the endpoint reports more."""
+    """One DM thread, oldest to newest. Accepts legacy "a-b" and XChat
+    "a:b" conversation ids. cursor (a previous min_entry_id) pages into
+    older history while the endpoint reports more."""
+    cid = conversation_id.replace(":", "-")
     tl = (
-        await c.rest(
-            f"/1.1/dm/conversation/{conversation_id}.json", {"max_id": cursor} if cursor else {}
-        )
+        await c.rest(f"/1.1/dm/conversation/{cid}.json", {"max_id": cursor} if cursor else {})
     ).get("conversation_timeline") or {}
     return {
-        "conversation": conversation_id,
+        "conversation": cid,
         "messages": dm_message_rows(tl),
         "cursor": tl.get("min_entry_id") if tl.get("status") not in ("AT_END", None) else None,
     }
@@ -289,7 +330,7 @@ async def dm_conversation(c, conversation_id: str, cursor: str | None = None) ->
 async def dm_send(c, to: str, text: str) -> dict:
     """Send a DM. `to` is @screen_name or an explicit a-b conversation id.
     1:1 conversation ids are the two numeric user ids joined low-high."""
-    name = to.lstrip("@")
+    name = to.lstrip("@").replace(":", "-")
     if _CONVERSATION_ID.match(name):
         cid = name
     else:

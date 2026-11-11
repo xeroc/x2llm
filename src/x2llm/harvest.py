@@ -34,6 +34,8 @@ READS = {
     "ViewerBadgeCounts": "badges",
     "accountOverviewDailyQuery": "analytics",
     "UserByScreenName": "user",
+    "GetInitialXChatPageQuery": "xchat_inbox",
+    "GetInboxPageRequestQuery": "xchat_inbox_page",
 }
 POST_READS = {
     "HomeTimeline": "home",  # FOR YOU tab
@@ -100,11 +102,12 @@ def harvest(paths: list[str]) -> tuple[dict, dict[str, str], dict]:
                     except ValueError:
                         pass  # non-JSON body - keep scanning
             url = req["url"]
-            if "/i/api/graphql/" not in url:
+            if "/i/api/graphql/" not in url and "api.x.com/graphql/" not in url:
                 continue
             op = url.split("/graphql/", 1)[1].split("/", 1)[1].split("?", 1)[0]
             key = READS.get(op) or POST_READS.get(op) or MUTATIONS.get(op)
-            if key and key not in txids and tx:
+            # api.x.com txids look single-use: pool only x.com/i/api ones
+            if key and key not in txids and tx and "api.x.com/graphql/" not in url:
                 txids[key] = tx
             if key is None or key in graphql:
                 continue
@@ -115,6 +118,8 @@ def harvest(paths: list[str]) -> tuple[dict, dict[str, str], dict]:
                 "name": op,
                 "method": "post" if op in MUTATIONS or op in POST_READS else "get",
             }
+            if "api.x.com/graphql/" in url:
+                entry["base"] = "https://api.x.com"
             if req["method"] == "POST" and req.get("postData", {}).get("text"):
                 body = json.loads(req["postData"]["text"])
                 if "features" in body:

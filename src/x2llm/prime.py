@@ -21,8 +21,10 @@ JSON - pipe it into your context and go.
 - Errors print `{"error": "..."}` and exit non-zero. Never retry blindly -
   the error text says what to do.
 - Pagination: list commands return a `cursor`; feed it back via
-  `--cursor` for the next page; `null` means end. Exception: `dms` - the
-  inbox endpoint only answers the ~30 most recent conversations.
+  `--cursor` for the next page; `null` means end. For `dms` the first
+  page carries plaintext previews + unread flags (~30 conversations);
+  deeper pages walk every conversation ever (50/page, XChat inbox) with
+  metadata-only previews - message bodies there are E2E-encrypted.
 - Three REAL write actions exist (`post`, `like`, `dm-send`) - see below.
 
 ## Accounts
@@ -45,7 +47,7 @@ JSON - pipe it into your context and go.
 | `x2llm search QUERY` | Full search with X operators (see below) |
 | `x2llm tweet ID` | One tweet plus its reply thread |
 | `x2llm home` / `--tab following` | Home timeline (algorithmic / chronological) |
-| `x2llm dms` | DM inbox: recent conversations, last message, unread flags |
+| `x2llm dms [--cursor C]` | DM inbox; `--cursor` walks deeper conversations |
 | `x2llm dm CONV_ID` | One DM thread, oldest to newest (`--cursor` for older) |
 | `x2llm dm-send USER "text"` | Send a DM to @USER (REAL action) |
 | `x2llm notifications` | The account's notification tab |

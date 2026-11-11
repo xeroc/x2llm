@@ -69,11 +69,16 @@ class XClient:
         if ep.get("toggles"):
             params["fieldToggles"] = json.dumps(ep["toggles"], separators=(",", ":"))
         path = f"/graphql/{ep['query_id']}/{ep['name']}"
+        base = ep.get("base") or self.config.api_base
+        # api.x.com (xchat) txids look single-use: browser-captured ones are
+        # rejected on replay, and requests without the header are accepted -
+        # so never attach one for ops on another base.
+        txid = None if ep.get("base") else await self._txid(key, "GET", f"/i/api{path}")
         await self._throttle()
         response = await self._http.get(
-            f"{self.config.api_base}{path}",
+            f"{base}{path}",
             params=params,
-            headers=self._headers(await self._txid(key, "GET", f"/i/api{path}")),
+            headers=self._headers(txid),
         )
         return self._json(response, ep["name"])
 

@@ -120,9 +120,11 @@ MCP_TOOLS = [
     (
         "list_dm_conversations",
         (
-            "The account's DM inbox: recent conversations with participants, "
-            "last message and unread flags. Covers the ~30 most recent - "
-            "the inbox endpoint no longer pages deeper."
+            "The account's DM inbox, paginated. First page: ~30 recent "
+            "conversations with plaintext previews and unread flags. Pass "
+            "the returned cursor for deeper pages (50/page via the XChat "
+            "inbox - every conversation ever, but previews there are "
+            "metadata-only since message bodies are E2E-encrypted)."
         ),
         cores.dm_inbox,
         True,

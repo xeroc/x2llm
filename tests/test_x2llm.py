@@ -6,6 +6,7 @@ roundtrip. No test touches the network or the real account db.
 from __future__ import annotations
 
 import asyncio
+import base64
 import inspect
 import json
 import os
@@ -1347,7 +1348,7 @@ def test_dm_inbox_core_sorts_flags_and_resolves_names():
     assert first["participants"] == ["fabian", "alice"]
     assert second["with"] == "bob" and second["unread"] is False and second["muted"] is True
     assert second["last_message"]["sender"] == "fabian"
-    assert "cursor" not in result  # x.com removed 1.1 inbox paging
+    assert result["cursor"] == "0|"  # first page done; next walks XChat pages
 
 
 def dm_thread_payload(status="HAS_MORE"):
@@ -1448,3 +1449,214 @@ def test_cli_dms_json_out(monkeypatch, db):
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     assert payload["conversations"][0]["with"] == "alice"
+
+
+# --- dms pagination (XChat inbox pages on api.x.com) -----------------------------
+
+
+def _tlv(field: int, value: bytes) -> bytes:
+    return b"\x0b" + field.to_bytes(2, "big") + len(value).to_bytes(4, "big") + value
+
+
+def _xchat_event_b64(seq: str, uid: str, time_ms: str) -> str:
+    blob = _tlv(1, seq.encode()) + _tlv(3, uid.encode()) + _tlv(6, time_ms.encode())
+    return base64.b64encode(blob).decode()
+
+
+def _xchat_item(
+    cid: str, screen_name: str, uid: str, muted=False, seq="300", time_ms="1794000000000"
+):
+    return {
+        "__typename": "XChatGetInboxPageConversationData",
+        "conversation_detail": {
+            "__typename": "XChatDirectConversationDetail",
+            "conversation_id": cid,
+            "is_archived": False,
+            "is_muted": muted,
+            "participants_results": [
+                {
+                    "__typename": "UserResults",
+                    "rest_id": uid,
+                    "result": {
+                        "__typename": "User",
+                        "core": {"__typename": "UserCore", "screen_name": screen_name},
+                    },
+                }
+            ],
+        },
+        "latest_message_events": [_xchat_event_b64(seq, uid, time_ms)],
+    }
+
+
+def test_xchat_conversation_rows_maps_items():
+    items = [
+        _xchat_item("111:222", "alice", "222", muted=True),
+        _xchat_item("111:333", "bob", "333", seq="100", time_ms="1793000000000"),
+    ]
+    rows = parse.xchat_conversation_rows(items)
+    first, second = rows
+    assert first["id"] == "111-222"  # colon -> legacy dash
+    assert first["with"] == "alice" and first["participants"] == ["alice"]
+    assert first["type"] == "ONE_TO_ONE" and first["muted"] is True
+    assert first["last_message"]["sender"] == "alice"
+    assert first["last_message"]["id"] == "300"
+    assert "text" not in first["last_message"]  # E2EE: no plaintext on these pages
+    assert second["last_message"]["time"] == "2026-10-26T07:33:20+00:00"
+
+
+def xchat_page_response(cursor_id="50", snapshot="SNAP", exhausted=False, items=None):
+    cursor = {
+        "__typename": "XChatGetInboxPageEndCursor",
+        "inbox_exhausted": True,
+        "graph_snapshot_id": snapshot,
+    }
+    if not exhausted:
+        cursor = {
+            "__typename": "XChatGetInboxPageContinueCursor",
+            "cursor_id": cursor_id,
+            "graph_snapshot_id": snapshot,
+        }
+    return {"data": {"get_inbox_page": {"items": items or [], "inboxCursor": cursor}}}
+
+
+def xchat_initial_response(items):
+    return {
+        "data": {
+            "get_initial_chat_page": {
+                "items": items,
+                "inboxCursor": {"cursor_id": "50", "graph_snapshot_id": "SNAP"},
+            }
+        }
+    }
+
+
+def test_dm_inbox_first_page_hands_out_xchat_cursor():
+    fake = FakeRoutingClient([("inbox_initial_state", dm_inbox_payload())])
+    result = _run(cores.dm_inbox(fake))
+    assert result["cursor"] == "0|"  # next: first XChat page
+    assert result["conversations"][0]["with"] == "alice"
+
+
+def test_dm_inbox_xchat_initial_and_continue_pages():
+    fake = FakeRoutingClient(
+        [
+            (
+                "xchat_inbox_page",
+                xchat_page_response(cursor_id="100", items=[_xchat_item("111:333", "bob", "333")]),
+            ),
+            ("xchat_inbox", xchat_initial_response([_xchat_item("111:222", "alice", "222")])),
+        ]
+    )
+    page1 = _run(cores.dm_inbox(fake, cursor="0|"))
+    kind, key, variables = fake.calls[0]
+    assert (kind, key) == ("graphql", "xchat_inbox")
+    assert variables["max_local_sequence_id"] == "1"
+    assert variables["query_settings"]["inbox_conversation_limit"] == 50
+    assert page1["cursor"] == "50|SNAP"
+    assert page1["conversations"][0]["id"] == "111-222"
+
+    page2 = _run(cores.dm_inbox(fake, cursor="50|SNAP"))
+    kind, key, variables = fake.calls[1]
+    assert (kind, key) == ("graphql", "xchat_inbox_page")
+    assert variables["continue_cursor"] == {
+        "cursor_id": "50",
+        "graph_snapshot_id": "SNAP",
+        "graph_snapshot_restarted": False,
+    }
+    assert page2["cursor"] == "100|SNAP"
+    assert page2["conversations"][0]["with"] == "bob"
+
+
+def test_dm_inbox_xchat_exhausted_ends_pagination():
+    fake = FakeRoutingClient([("xchat_inbox_page", xchat_page_response(exhausted=True))])
+    result = _run(cores.dm_inbox(fake, cursor="100|SNAP"))
+    assert result["cursor"] is None
+    assert result["conversations"] == []
+
+
+def test_dm_conversation_normalizes_colon_ids():
+    fake = FakeRoutingClient([("conversation/111-222", dm_thread_payload(status="AT_END"))])
+    _run(cores.dm_conversation(fake, "111:222"))
+    assert fake.calls[0][1] == "/1.1/dm/conversation/111-222.json"
+
+
+def test_client_graphql_honors_registry_base(db):
+    from x2llm import store
+
+    store.upsert_wire(
+        {
+            "xchat_inbox": {
+                "query_id": "Q",
+                "name": "GetInitialXChatPageQuery",
+                "method": "get",
+                "base": "https://api.x.com",
+            }
+        }
+    )
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((str(request.url), request.headers.get("x-client-transaction-id")))
+        return httpx.Response(200, json={"data": {}})
+
+    async def go():
+        client = XClient(mkconfig(), transport=httpx.MockTransport(handler))
+        try:
+            await client.graphql("xchat_inbox", {"max_local_sequence_id": "1"})
+        finally:
+            await client.aclose()
+
+    _run(go())
+    url, txid = seen[0]
+    assert url.startswith("https://api.x.com/graphql/Q/GetInitialXChatPageQuery")
+    # api.x.com txids look single-use; requests without one are accepted
+    assert txid is None
+
+
+def test_harvest_maps_apix_xchat_operations(tmp_path):
+    from x2llm import harvest as h
+
+    har = {
+        "log": {
+            "entries": [
+                {
+                    "startedDateTime": "2026-11-11T11:17:44",
+                    "request": {
+                        "method": "GET",
+                        "url": "https://api.x.com/graphql/Hv18nE2Cg6YZJNcRVLGT-g/GetInboxPageRequestQuery?variables=%7B%7D",
+                        "headers": [
+                            {"name": "x-client-transaction-id", "value": "T"},
+                            {"name": "authorization", "value": "Bearer x"},
+                            {"name": "cookie", "value": "auth_token=a; ct0=c"},
+                        ],
+                    },
+                }
+            ]
+        }
+    }
+    p = tmp_path / "x.har"
+    p.write_text(json.dumps(har))
+    graphql, txids, _ = h.harvest([str(p)])
+    assert graphql["xchat_inbox_page"] == {
+        "query_id": "Hv18nE2Cg6YZJNcRVLGT-g",
+        "name": "GetInboxPageRequestQuery",
+        "method": "get",
+        "base": "https://api.x.com",
+    }
+    assert txids == {}  # api.x.com txids are single-use - never pooled
+
+
+def test_cli_dms_cursor_pages(monkeypatch, db):
+    _seed(db)
+    monkeypatch.setattr(
+        cli,
+        "XClient",
+        lambda cfg: FakeRoutingClient(
+            [("xchat_inbox", xchat_initial_response([_xchat_item("111:222", "alice", "222")]))]
+        ),
+    )
+    result = CliRunner().invoke(cli.cli, ["dms", "--cursor", "0|"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["conversations"][0]["with"] == "alice"
+    assert payload["cursor"] == "50|SNAP"
